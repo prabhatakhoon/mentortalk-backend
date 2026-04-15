@@ -1,0 +1,19 @@
+﻿{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": ["scheduler:CreateSchedule", "scheduler:DeleteSchedule"],
+            "Resource": [
+                "arn:aws:scheduler:ap-south-1:*:schedule/default/session-request-*",
+                "arn:aws:scheduler:ap-south-1:*:schedule/default/session-disconnect-*",
+                "arn:aws:scheduler:ap-south-1:*:schedule/default/session-grace-*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": "iam:PassRole",
+            "Resource": "arn:aws:iam::593083377452:role/mentortalk-scheduler-role"
+        }
+    ]
+}

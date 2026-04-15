@@ -1,0 +1,14 @@
+{
+  "name": "mentortalk-ws-connect",
+  "version": "1.0.0",
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.0.0",
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.0.0",
+    "@aws-sdk/client-sfn": "^3.0.0",
+    "@aws-sdk/client-scheduler": "^3.0.0",
+    "pg": "^8.11.0",
+    "jsonwebtoken": "^9.0.0"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "mentortalk-session",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/sessionHandler.js",
+  "dependencies": {
+    "pg": "^8.13.1",
+    "jsonwebtoken": "^9.0.2",
+    "agora-token": "^2.0.3"
+  }
+}
