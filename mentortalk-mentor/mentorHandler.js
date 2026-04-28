@@ -229,6 +229,7 @@ async function getProfile(userId) {
        u.created_at AS member_since,
        mp.profile_photo_url, mp.bio, mp.rate_per_minute,
        mp.is_available, mp.pref_audio, mp.pref_video,
+       mp.intro_discount_percent,
        mw.balance AS wallet_balance, mp.avg_rating, mp.total_reviews,
        mp.unlocked_tier_id,
        rt.name AS tier_name, rt.max_rate AS tier_max_rate,
@@ -267,6 +268,10 @@ LEFT JOIN user_language ul ON ul.user_id = u.id AND ul.role = 'mentor'
     profile_image_url: toFullUrl(row.profile_photo_url),
     bio: row.bio,
     rate_per_minute: row.rate_per_minute ? parseFloat(row.rate_per_minute) : null,
+    intro_discount_percent: row.intro_discount_percent,
+    intro_rate_per_minute: row.intro_discount_percent != null
+      ? parseFloat(row.rate_per_minute) * (1 - row.intro_discount_percent / 100)
+      : null,
     is_available: row.is_available,
     pref_audio: row.pref_audio,
     pref_video: row.pref_video,
@@ -340,6 +345,14 @@ async function updateProfile(userId, event) {
     }
     profileUpdates.push(`rate_per_minute = $${pidx++}`);
     profileValues.push(body.rate_per_minute);
+  }
+  if (body.intro_discount_percent !== undefined) {
+    const valid = [null, 25, 50];
+    if (!valid.includes(body.intro_discount_percent)) {
+      return respond(400, { error: "intro_discount_percent must be null, 25, or 50" });
+    }
+    profileUpdates.push(`intro_discount_percent = $${pidx++}`);
+    profileValues.push(body.intro_discount_percent);
   }
 
   // ── Languages (ISO 639-1 codes via user_language junction table) ──
