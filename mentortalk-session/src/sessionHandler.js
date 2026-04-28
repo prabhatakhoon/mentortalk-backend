@@ -414,7 +414,7 @@ async function handleSessionRequest(menteeId, event) {
     `SELECT u.id, mp.first_name, mp.last_name,
             mp.rate_per_minute, mp.profile_photo_url,
             mp.is_available, mp.pref_audio, mp.pref_video,
-            mp.intro_rate_enabled
+            mp.intro_discount_percent
      FROM "user" u
      JOIN mentor_profile mp ON mp.user_id = u.id
      JOIN mentorship_application ma ON ma.user_id = u.id
@@ -458,14 +458,14 @@ async function handleSessionRequest(menteeId, event) {
       [menteeId]
     );
 
-    if (promoResult.rows.length > 0 && !promoResult.rows[0].intro_session_used && mentor.intro_rate_enabled !== false) {
+    if (promoResult.rows.length > 0 && !promoResult.rows[0].intro_session_used && mentor.intro_discount_percent != null) {
       const cfgResult = await db.query(
-        `SELECT intro_rate_enabled, intro_rate_per_minute FROM promo_config WHERE id = 1`
+        `SELECT intro_rate_enabled FROM promo_config WHERE id = 1`
       );
       const cfg = cfgResult.rows[0];
       if (cfg?.intro_rate_enabled) {
         billingType = 'intro_rate';
-        introRatePerMinute = parseFloat(cfg.intro_rate_per_minute);
+        introRatePerMinute = baseRate * (1 - mentor.intro_discount_percent / 100);
       }
     }
   }
@@ -671,8 +671,13 @@ async function handleSessionAccept(userId, event) {
     if (session.billing_type === 'free_intro') {
       effectiveRate = 0;
     } else if (session.billing_type === 'intro_rate') {
-      const cfg = (await client.query(`SELECT intro_rate_per_minute FROM promo_config WHERE id = 1`)).rows[0];
-      if (cfg) effectiveRate = parseFloat(cfg.intro_rate_per_minute);
+      const mentorDiscount = (await client.query(
+        `SELECT intro_discount_percent FROM mentor_profile WHERE user_id = $1`,
+        [session.mentor_id]
+      )).rows[0];
+      if (mentorDiscount?.intro_discount_percent != null) {
+        effectiveRate = baseRate * (1 - mentorDiscount.intro_discount_percent / 100);
+      }
     }
 
     await client.query(
@@ -1511,10 +1516,14 @@ async function promoteNextPendingSession(db, mentorId) {
   let promotedNormalRate = undefined;
 
   if (promotedBillingType === 'intro_rate') {
-    const cfgPromo = await db.query(
-      `SELECT intro_rate_per_minute FROM promo_config WHERE id = 1`
+    const mentorDiscount = await db.query(
+      `SELECT intro_discount_percent FROM mentor_profile WHERE user_id = $1`,
+      [mentorId]
     );
-    promotedEffectiveRate = parseFloat(cfgPromo.rows[0]?.intro_rate_per_minute) || ratePerMinute;
+    const discountPercent = mentorDiscount.rows[0]?.intro_discount_percent;
+    if (discountPercent != null) {
+      promotedEffectiveRate = ratePerMinute * (1 - discountPercent / 100);
+    }
     promotedNormalRate = ratePerMinute;
   }
 
