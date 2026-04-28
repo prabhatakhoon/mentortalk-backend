@@ -185,7 +185,7 @@ async function handleGetMessages(userId, app, event) {
         await client.query(
           `INSERT INTO support_message (user_id, ticket_id, sender_type, content, type, created_at)
            VALUES ($1, $2, 'system', $3, 'system', NOW())`,
-          [userId, ticketId],
+          [userId, ticketId, `Ticket opened · #${ticketNumber}`],
         );
 
         if (isFirstTicket) {
@@ -298,7 +298,7 @@ async function handleSendMessage(userId, app, event) {
         `INSERT INTO support_message (user_id, ticket_id, sender_type, content, type, created_at)
          VALUES ($1, $2, 'system', $3, 'system', NOW())
          RETURNING id, sender_type, content, type, created_at`,
-        [userId, ticketId],
+        [userId, ticketId, `Ticket opened · #${ticketNumber}`],
       );
       newMessages.push(ticketOpenedMsg.rows[0]);
 
