@@ -454,7 +454,7 @@ async function getChats(db, userId, queryParams) {
        mp.first_name,
        mp.last_name,
        mp.pref_audio,
-       mp.intro_rate_enabled,
+       mp.intro_discount_percent,
        mp.pref_video,
       mp.profile_photo_url,
        mp.rate_per_minute,
@@ -466,7 +466,7 @@ async function getChats(db, userId, queryParams) {
      WHERE s.mentee_id = $1
        AND s.status = 'completed'
        ${blockedCondition}
-     GROUP BY s.mentor_id, mp.first_name, mp.last_name, mp.profile_photo_url, mp.pref_audio, mp.pref_video, mp.intro_rate_enabled,      
+     GROUP BY s.mentor_id, mp.first_name, mp.last_name, mp.profile_photo_url, mp.pref_audio, mp.pref_video, mp.intro_discount_percent,
   mp.rate_per_minute, mp.is_available
      ORDER BY last_session_at DESC
      LIMIT $2 OFFSET $3`,
@@ -504,7 +504,11 @@ async function getChats(db, userId, queryParams) {
         last_activity: lastActivity,
         pref_audio: row.pref_audio ?? true,
         pref_video: row.pref_video ?? true,
-        intro_rate_eligible: menteeIntroEligible && (row.intro_rate_enabled ?? true),
+        intro_rate_eligible: menteeIntroEligible && row.intro_discount_percent != null,
+        intro_discount_percent: row.intro_discount_percent,
+        intro_rate_per_minute: (menteeIntroEligible && row.intro_discount_percent != null)
+          ? parseFloat(row.rate_per_minute) * (1 - row.intro_discount_percent / 100)
+          : null,
         rate_per_minute: parseFloat(row.rate_per_minute) || 0,
         is_available: row.is_available ?? false,
         presence: (row.is_available && presenceResult.Item?.status === "online") ? "online" : (presenceResult.Item?.status ===
