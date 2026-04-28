@@ -393,7 +393,7 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
          mp.profile_photo_url,
          mp.rate_per_minute,
         mp.is_available,
-         mp.intro_rate_enabled,
+         mp.intro_discount_percent,
          COALESCE(mp.avg_rating, 0)     AS avg_rating,
 
          COALESCE(mp.total_reviews, 0)  AS total_reviews,
@@ -439,7 +439,7 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
        total_sessions,
        rate_per_minute,
         is_available,
-       intro_rate_enabled,
+       intro_discount_percent,
        popularity_score,
        COUNT(*) OVER() AS total_count
      FROM scored
@@ -456,7 +456,13 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
   const mentors = await Promise.all(result.rows.map(formatMentorRow));
 
   for (let i = 0; i < mentors.length; i++) {
-    mentors[i].intro_rate_eligible = menteeIntroEligible && (result.rows[i].intro_rate_enabled ?? true);
+    const row = result.rows[i];
+    const eligible = menteeIntroEligible && row.intro_discount_percent != null;
+    mentors[i].intro_rate_eligible = eligible;
+    mentors[i].intro_discount_percent = row.intro_discount_percent;
+    mentors[i].intro_rate_per_minute = eligible
+      ? parseFloat(row.rate_per_minute) * (1 - row.intro_discount_percent / 100)
+      : null;
   }
 
   // Batch presence check — add is_online to each mentor
@@ -579,7 +585,7 @@ if (languages.length > 0) {
        mp.profile_photo_url,
        mp.rate_per_minute,
       mp.is_available,
-       mp.intro_rate_enabled,
+       mp.intro_discount_percent,
        COALESCE(mp.avg_rating, 0)    AS avg_rating,
        COALESCE(mp.total_reviews, 0) AS total_reviews,
 
@@ -603,7 +609,7 @@ if (languages.length > 0) {
      WHERE ${conditions.join("\n       AND ")}
     GROUP BY u.id, mp.first_name, mp.last_name,
               mp.profile_photo_url, mp.rate_per_minute, mp.is_available,
-             mp.avg_rating, mp.total_reviews, mp.intro_rate_enabled
+             mp.avg_rating, mp.total_reviews, mp.intro_discount_percent
      ORDER BY ${orderClause}
      LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
     params
@@ -617,7 +623,13 @@ if (languages.length > 0) {
   const mentors = await Promise.all(result.rows.map(formatMentorRow));
 
   for (let i = 0; i < mentors.length; i++) {
-    mentors[i].intro_rate_eligible = menteeIntroEligible && (result.rows[i].intro_rate_enabled ?? true);
+    const row = result.rows[i];
+    const eligible = menteeIntroEligible && row.intro_discount_percent != null;
+    mentors[i].intro_rate_eligible = eligible;
+    mentors[i].intro_discount_percent = row.intro_discount_percent;
+    mentors[i].intro_rate_per_minute = eligible
+      ? parseFloat(row.rate_per_minute) * (1 - row.intro_discount_percent / 100)
+      : null;
   }
 
   // Batch presence check
@@ -723,7 +735,7 @@ async function getMentorProfile(db, userId, queryParams, menteeIntroEligible = f
        mp.pref_video,
        mp.avg_rating,
         mp.total_reviews,
-       mp.intro_rate_enabled,
+       mp.intro_discount_percent,
 
        -- Completed sessions count
        (SELECT COUNT(*)
@@ -860,7 +872,11 @@ async function getMentorProfile(db, userId, queryParams, menteeIntroEligible = f
     bio: row.bio || null,
     rate_per_minute: parseInt(row.rate_per_minute) || 0,
     is_available: row.is_available ?? false,
-    intro_rate_eligible: menteeIntroEligible && (row.intro_rate_enabled ?? true),
+    intro_rate_eligible: menteeIntroEligible && row.intro_discount_percent != null,
+    intro_discount_percent: row.intro_discount_percent,
+    intro_rate_per_minute: (menteeIntroEligible && row.intro_discount_percent != null)
+      ? parseFloat(row.rate_per_minute) * (1 - row.intro_discount_percent / 100)
+      : null,
     pref_audio: row.pref_audio ?? true,
     pref_video: row.pref_video ?? true,
     avg_rating: parseFloat(Number(row.avg_rating).toFixed(1)),
@@ -931,7 +947,7 @@ async function getFollowing(db, userId, queryParams, menteeIntroEligible = false
        mp.profile_photo_url,
        mp.rate_per_minute,
          mp.is_available,
-       mp.intro_rate_enabled,
+       mp.intro_discount_percent,
        COALESCE(mp.avg_rating, 0) AS avg_rating,
        COALESCE(mp.total_reviews, 0) AS total_reviews,
        (SELECT COUNT(*) FROM session s WHERE s.mentor_id = f.mentor_id AND s.status = 'completed') AS total_sessions,
@@ -968,7 +984,13 @@ async function getFollowing(db, userId, queryParams, menteeIntroEligible = false
   }));
 
   for (let i = 0; i < mentors.length; i++) {
-    mentors[i].intro_rate_eligible = menteeIntroEligible && (result.rows[i].intro_rate_enabled ?? true);
+    const row = result.rows[i];
+    const eligible = menteeIntroEligible && row.intro_discount_percent != null;
+    mentors[i].intro_rate_eligible = eligible;
+    mentors[i].intro_discount_percent = row.intro_discount_percent;
+    mentors[i].intro_rate_per_minute = eligible
+      ? parseFloat(row.rate_per_minute) * (1 - row.intro_discount_percent / 100)
+      : null;
   }
 
  // Batch presence check
