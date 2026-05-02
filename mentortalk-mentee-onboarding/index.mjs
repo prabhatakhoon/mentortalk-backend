@@ -320,6 +320,14 @@ async function submitOnboarding(db, userId) {
     [userId]
   );
 
+  // Create mentee privacy settings row with defaults from column definitions
+  await db.query(
+    `INSERT INTO mentee_privacy_settings (user_id)
+     VALUES ($1)
+     ON CONFLICT (user_id) DO NOTHING`,
+    [userId]
+  );
+
   console.log(`[DB] Onboarding completed for user ${userId}`);
   return res(200, { success: true });
 }
