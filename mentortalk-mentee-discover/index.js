@@ -1025,10 +1025,12 @@ async function getMentorReviews(db, queryParams) {
        r.created_at,
        mp.first_name AS mentee_first_name,
        mp.last_name  AS mentee_last_name,
-       mp.profile_photo_url AS mentee_photo_url
+       mp.profile_photo_url AS mentee_photo_url,
+       COALESCE(mps.show_name_in_reviews, TRUE) AS show_name
      FROM review r
      JOIN session s ON s.id = r.session_id
      JOIN mentee_profile mp ON mp.user_id = r.mentee_id
+     LEFT JOIN mentee_privacy_settings mps ON mps.user_id = r.mentee_id
      WHERE r.mentor_id = $1
      ORDER BY r.created_at DESC
      LIMIT $2 OFFSET $3`,
@@ -1048,10 +1050,12 @@ async function getMentorReviews(db, queryParams) {
 
   const items = await Promise.all(
     reviews.map(async (r) => {
-      const avatar = await resolvePhotoUrl(r.mentee_photo_url, r.session_id);
-      const name = [r.mentee_first_name, r.mentee_last_name]
-        .filter(Boolean)
-        .join(" ") || "Mentee";
+      const avatar = r.show_name
+        ? await resolvePhotoUrl(r.mentee_photo_url, r.session_id)
+        : null;
+      const name = r.show_name
+        ? ([r.mentee_first_name, r.mentee_last_name].filter(Boolean).join(" ") || "Mentee")
+        : null;
 
       return {
         id: r.id,
