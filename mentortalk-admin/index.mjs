@@ -280,6 +280,16 @@ const handlers = {
         [appData.user_id],
       );
 
+      // Seed default quick replies for new mentor
+      await db.query(
+        `INSERT INTO mentor_quick_reply (user_id, content, sort_order) VALUES
+          ($1, 'Let me explain this step by step, follow along', 0),
+          ($1, 'Can you share a screenshot of the question?', 1),
+          ($1, 'Well done! Do you have any other doubts?', 2),
+          ($1, 'We''re running low on time, recharge to continue or let me know your last doubt!', 3)`,
+        [appData.user_id],
+      );
+
       notificationTitle = "Application Approved!";
       notificationBody =
         "Congratulations! Your mentor application has been approved. Welcome aboard!";
