@@ -885,12 +885,15 @@ async function getReviews(userId, event) {
     comment: row.comment,
     session_id: row.session_id,
     session_date: row.session_date,
-    mentee: {
-      name: row.show_name
-        ? [row.mentee_first_name, row.mentee_last_name].filter(Boolean).join(" ")
-        : null,
-      avatar: row.show_name ? toFullUrl(row.mentee_avatar) : null,
-    },
+    // Privacy: when show_name_in_reviews is false, omit the entire mentee
+    // object so the client renders its localized fallback. Nulling leaf
+    // fields would break the non-nullable name field on the client model.
+    mentee: row.show_name
+      ? {
+          name: [row.mentee_first_name, row.mentee_last_name].filter(Boolean).join(" "),
+          avatar: toFullUrl(row.mentee_avatar),
+        }
+      : null,
     modes: Array.isArray(row.modes) ? row.modes : (row.modes || '').replace(/[{}]/g, '').split(',').filter(Boolean),
     created_at: row.created_at,
   }));
