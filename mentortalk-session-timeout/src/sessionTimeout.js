@@ -205,9 +205,24 @@ export const handler = async (event) => {
     }
 
     // 3b. Calculate splits
-    const platformFeeRate = 0.50;
-    const platformFee = grossAmount * platformFeeRate;
-    const mentorEarning = grossAmount - platformFee;
+    let platformFee, mentorEarning;
+    if (session.billing_type === 'paid' && grossAmount > 0) {
+      // Platform takes 100% of minute 1, then 50/50 from minute 2 onward.
+      const firstMinuteRate = parseFloat(segRows.rows[0]?.rate_per_minute) || 0;
+      const remainingAmount = Math.max(0, grossAmount - firstMinuteRate);
+      mentorEarning = remainingAmount * 0.5;
+      platformFee = grossAmount - mentorEarning;
+    } else {
+      platformFee = grossAmount * 0.50;
+      mentorEarning = grossAmount - platformFee;
+    }
+
+    if (Math.abs(grossAmount - (platformFee + mentorEarning)) > 0.0001) {
+      throw new Error(
+        `Billing assertion failed for session ${sessionId}: ` +
+        `total=${grossAmount}, platform=${platformFee}, mentor=${mentorEarning}`
+      );
+    }
    // 4. Create transactions
    if (grossAmount > 0) {
     await client.query(
@@ -219,6 +234,7 @@ export const handler = async (event) => {
       [session.mentee_id, grossAmount, sessionId]
     );
 
+    // Write session_earning even when amount is 0 (1-min paid sessions)
     await client.query(
       `INSERT INTO transaction (wallet_id, user_id, type, direction, amount, session_id, status)
        VALUES (
