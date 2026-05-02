@@ -167,10 +167,16 @@ async function getProfile(db, userId) {
        mp.profile_photo_url,
        mp.first_name,
        mp.last_name,
-       u.phone_number
+       u.phone_number,
+       COALESCE(mps.show_name_in_reviews, TRUE)    AS show_name_in_reviews,
+       COALESCE(mps.mentor_chat_access, FALSE)     AS mentor_chat_access,
+       COALESCE(mps.mentor_download_access, FALSE) AS mentor_download_access,
+       COALESCE(mps.block_screenshots, FALSE)      AS block_screenshots,
+       COALESCE(mps.block_call_recording, FALSE)   AS block_call_recording
      FROM mentee_profile mp
      JOIN "user" u ON u.id = mp.user_id
      LEFT JOIN wallet w ON w.user_id = mp.user_id AND w.type = 'mentee'
+     LEFT JOIN mentee_privacy_settings mps ON mps.user_id = mp.user_id
      WHERE mp.user_id = $1`,
     [userId]
   );
@@ -193,7 +199,96 @@ async function getProfile(db, userId) {
     wallet_balance: profile.wallet_balance ?? 0,
     phone_number: profile.phone_number,
     profile_photo_url: photoUrl,
+    privacy_settings: {
+      show_name_in_reviews: profile.show_name_in_reviews,
+      mentor_chat_access: profile.mentor_chat_access,
+      mentor_download_access: profile.mentor_download_access,
+      block_screenshots: profile.block_screenshots,
+      block_call_recording: profile.block_call_recording,
+    },
   });
+}
+
+/**
+ * GET /mentee/privacy-settings
+ */
+async function getPrivacySettings(db, userId) {
+  const { rows } = await db.query(
+    `SELECT show_name_in_reviews, mentor_chat_access, mentor_download_access,
+            block_screenshots, block_call_recording
+       FROM mentee_privacy_settings
+      WHERE user_id = $1`,
+    [userId]
+  );
+
+  if (rows.length === 0) {
+    // Defensive: lazy-create with defaults. Onboarding backfill should make this unreachable.
+    await db.query(
+      `INSERT INTO mentee_privacy_settings (user_id) VALUES ($1)
+       ON CONFLICT (user_id) DO NOTHING`,
+      [userId]
+    );
+    return res(200, {
+      show_name_in_reviews: true,
+      mentor_chat_access: false,
+      mentor_download_access: false,
+      block_screenshots: false,
+      block_call_recording: false,
+    });
+  }
+
+  return res(200, rows[0]);
+}
+
+/**
+ * PATCH /mentee/privacy-settings
+ */
+async function updatePrivacySettings(db, userId, body) {
+  const allowedKeys = [
+    "show_name_in_reviews",
+    "mentor_chat_access",
+    "mentor_download_access",
+    "block_screenshots",
+    "block_call_recording",
+  ];
+
+  const updates = {};
+  for (const key of allowedKeys) {
+    if (key in body) {
+      if (typeof body[key] !== "boolean") {
+        return res(400, { message: `${key} must be a boolean` });
+      }
+      updates[key] = body[key];
+    }
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return res(400, { message: "No valid fields to update" });
+  }
+
+  const setClauses = Object.keys(updates).map((k, i) => `${k} = $${i + 2}`);
+  const values = [userId, ...Object.values(updates)];
+
+  const { rows } = await db.query(
+    `UPDATE mentee_privacy_settings
+        SET ${setClauses.join(", ")}, updated_at = NOW()
+      WHERE user_id = $1
+      RETURNING show_name_in_reviews, mentor_chat_access, mentor_download_access,
+                block_screenshots, block_call_recording`,
+    values
+  );
+
+  if (rows.length === 0) {
+    // Lazy-create then retry once.
+    await db.query(
+      `INSERT INTO mentee_privacy_settings (user_id) VALUES ($1)
+       ON CONFLICT (user_id) DO NOTHING`,
+      [userId]
+    );
+    return await updatePrivacySettings(db, userId, body);
+  }
+
+  return res(200, rows[0]);
 }
 
 /**
@@ -1050,6 +1145,16 @@ if (method === "DELETE" && path.match(/\/mentee\/block\/[^/]+$/)) {
 // Blocked users list
 if (method === "GET" && path.endsWith("/block")) {
   return await getBlockedUsers(db, userId);
+}
+
+// Privacy settings
+if (method === "GET" && path.endsWith("/privacy-settings")) {
+  return await getPrivacySettings(db, userId);
+}
+
+if (method === "PATCH" && path.endsWith("/privacy-settings")) {
+  const body = parseBody(event);
+  return await updatePrivacySettings(db, userId, body);
 }
 
 // Account page profile
