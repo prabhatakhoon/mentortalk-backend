@@ -349,16 +349,15 @@ async function getTransactions(db, userId, queryParams) {
        t.notes,
        t.created_at,
        t.session_id,
-       u.first_name AS mentor_first_name,
-       u.last_name AS mentor_last_name,
-     mp.profile_photo_url AS mentor_photo_key,
+       mp.first_name AS mentor_first_name,
+       mp.last_name AS mentor_last_name,
+       mp.profile_photo_url AS mentor_photo_key,
        s.requested_session_type AS session_type,
        s.billing_type
      FROM transaction t
      JOIN wallet w ON w.id = t.wallet_id
      LEFT JOIN session s ON s.id = t.session_id
      LEFT JOIN mentor_profile mp ON mp.user_id = s.mentor_id
-     LEFT JOIN "user" u ON u.id = s.mentor_id
      WHERE t.user_id = $1 AND w.type = 'mentee'
      ORDER BY t.created_at DESC
      LIMIT $2 OFFSET $3`,
