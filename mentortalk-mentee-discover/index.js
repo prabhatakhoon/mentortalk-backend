@@ -1050,12 +1050,17 @@ async function getMentorReviews(db, queryParams) {
 
   const items = await Promise.all(
     reviews.map(async (r) => {
-      const avatar = r.show_name
-        ? await resolvePhotoUrl(r.mentee_photo_url, r.session_id)
-        : null;
-      const name = r.show_name
-        ? ([r.mentee_first_name, r.mentee_last_name].filter(Boolean).join(" ") || "Mentee")
-        : null;
+      // Privacy: when show_name_in_reviews is false, omit the entire mentee
+      // object so the client renders its localized fallback. Nulling leaf
+      // fields would break the non-nullable name field on the client model.
+      let mentee = null;
+      if (r.show_name) {
+        const avatar = await resolvePhotoUrl(r.mentee_photo_url, r.session_id);
+        const name = [r.mentee_first_name, r.mentee_last_name]
+          .filter(Boolean)
+          .join(" ") || "Mentee";
+        mentee = { name, avatar };
+      }
 
       return {
         id: r.id,
@@ -1063,7 +1068,7 @@ async function getMentorReviews(db, queryParams) {
         comment: r.comment || null,
         session_id: r.session_id,
         session_date: r.session_date,
-        mentee: { name, avatar },
+        mentee,
         modes: [],
         created_at: r.created_at,
       };
