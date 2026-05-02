@@ -346,12 +346,14 @@ async function getTransactions(db, userId, queryParams) {
        t.amount,
        t.reference_id,
        t.status,
+       t.notes,
        t.created_at,
        t.session_id,
        u.first_name AS mentor_first_name,
        u.last_name AS mentor_last_name,
      mp.profile_photo_url AS mentor_photo_key,
-       s.requested_session_type AS session_type
+       s.requested_session_type AS session_type,
+       s.billing_type
      FROM transaction t
      JOIN wallet w ON w.id = t.wallet_id
      LEFT JOIN session s ON s.id = t.session_id
@@ -374,22 +376,23 @@ async function getTransactions(db, userId, queryParams) {
       amount: parseFloat(row.amount),
       reference_id: row.reference_id,
       status: row.status,
+      notes: row.notes || null,
       created_at: row.created_at,
       session_id: row.session_id || null,
-      mentor_name: null,
-      mentor_photo_url: null,
+      other_user_name: null,
+      other_user_avatar: null,
       session_type: row.session_type || null,
+      billing_type: row.billing_type || null,
     };
 
-    // Build mentor name if session-based
     if (row.mentor_first_name) {
-      txn.mentor_name = [row.mentor_first_name, row.mentor_last_name]
+      txn.other_user_name = [row.mentor_first_name, row.mentor_last_name]
         .filter(Boolean)
         .join(" ");
     }
 
     if (row.mentor_photo_key) {
-      txn.mentor_photo_url = resolvePhotoUrl(row.mentor_photo_key);
+      txn.other_user_avatar = resolvePhotoUrl(row.mentor_photo_key);
     }
 
     transactions.push(txn);
