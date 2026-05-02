@@ -1668,6 +1668,8 @@ async function getMenteeMessages(userId, event) {
               type: msgType,
               created_at: item.created_at,
               client_message_id: item.client_message_id || null,
+              system_event: item.system_event || null,
+              metadata: item.metadata || null,
             };
 
             if (item.media_url) {
