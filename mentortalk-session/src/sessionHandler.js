@@ -366,11 +366,14 @@ async function handleGetMessages(userId, event) {
   const messages = await Promise.all((result.Items || [])).map(async (item) => {
     const msg = {
       message_id: item.message_id,
+      session_id: item.session_id,
       sender_id: item.sender_id,
       content: item.content,
       type: item.type || "text",
       created_at: item.created_at,
       client_message_id: item.client_message_id || null,
+      system_event: item.system_event || null,
+      metadata: item.metadata || null,
     };
 
     if (item.media_url) {
@@ -791,12 +794,15 @@ system_event: `${sessionType}_started`,
   // Push "Session started" as new_message to both users
   const sessionStartedPayload = {
     type: "new_message",
+    message_type: "system",
     message_id: sessionStartedMsgId,
     session_id: sessionId,
     sender_id: "system",
     content: sessionType === 'audio' ? "Audio call started"
              : sessionType === 'video' ? "Video call started"
              : "Chat started",
+    system_event: `${sessionType}_started`,
+    metadata: null,
     created_at: sessionStartedAt,
   };
 
@@ -862,6 +868,8 @@ system_event: `${sessionType}_started`,
   const mentorName = [row?.first_name, row?.last_name].filter(Boolean).join(' ') || 'Mentor';
   const mentorAvatar = toFullUrl(row?.profile_photo_url);
 
+  const minDurationSecs = parseInt(process.env.MIN_SESSION_DURATION_SECS ?? '60', 10);
+
   // Push to mentee: session accepted
   const menteeWsPayload = {
     type: "session_accepted",
@@ -872,6 +880,7 @@ system_event: `${sessionType}_started`,
     rate_per_minute: session.billing_type === 'free_intro' ? 0 : ratePerMinute,
     mentee_balance: menteeBalance,
     max_duration_seconds: maxDurationSeconds,
+    min_duration_secs: minDurationSecs,
     pref_audio: session.pref_audio ?? true,
     pref_video: session.pref_video ?? true,
   };
@@ -920,6 +929,7 @@ system_event: `${sessionType}_started`,
     rate_per_minute: session.billing_type === 'free_intro' ? 0 : ratePerMinute,
     mentee_balance: menteeBalance,
     max_duration_seconds: maxDurationSeconds,
+    min_duration_secs: minDurationSecs,
     pref_audio: session.pref_audio ?? true,
     pref_video: session.pref_video ?? true,
     mentee: {
@@ -1278,9 +1288,24 @@ async function handleSessionEnd(userId, event) {
       grossAmount = 0;
     }
 
-    const platformFeeRate = 0.50;
-    const platformFee = grossAmount * platformFeeRate;
-    const mentorEarning = grossAmount - platformFee;
+    let platformFee, mentorEarning;
+    if (session.billing_type === 'paid' && grossAmount > 0) {
+      // Platform takes 100% of minute 1, then 50/50 from minute 2 onward.
+      const firstMinuteRate = parseFloat(segRows.rows[0]?.rate_per_minute) || 0;
+      const remainingAmount = Math.max(0, grossAmount - firstMinuteRate);
+      mentorEarning = remainingAmount * 0.5;
+      platformFee = grossAmount - mentorEarning;
+    } else {
+      platformFee = grossAmount * 0.50;
+      mentorEarning = grossAmount - platformFee;
+    }
+
+    if (Math.abs(grossAmount - (platformFee + mentorEarning)) > 0.0001) {
+      throw new Error(
+        `Billing assertion failed for session ${sessionId}: ` +
+        `total=${grossAmount}, platform=${platformFee}, mentor=${mentorEarning}`
+      );
+    }
 
     if (grossAmount > 0) {
       await client.query(
@@ -1292,6 +1317,7 @@ async function handleSessionEnd(userId, event) {
         [session.mentee_id, grossAmount, sessionId]
       );
 
+      // Write session_earning even when amount is 0 (1-min paid sessions)
       await client.query(
         `INSERT INTO transaction (wallet_id, user_id, type, direction, amount, session_id, status)
          VALUES (
@@ -1434,6 +1460,9 @@ async function handleSessionEnd(userId, event) {
     const endedMsgId = `msg_${Date.now().toString(36)}_system`;
     const endedMsgAt = new Date().toISOString();
 
+    const sessionEndedEvent = `${sessionMode}_ended`;
+    const sessionEndedMetadata = JSON.stringify({ duration_seconds: totalDuration });
+
     await dynamoClient.send(new PutCommand({
       TableName: "mentortalk-messages",
       Item: {
@@ -1442,6 +1471,8 @@ async function handleSessionEnd(userId, event) {
         sender_id: "system",
         type: "system",
         content: `${endedByName} ended the ${sessionMode === 'audio' ? 'audio call' : sessionMode === 'video' ? 'video call' : 'chat'}`,
+        system_event: sessionEndedEvent,
+        metadata: sessionEndedMetadata,
         created_at: endedMsgAt,
       },
     }));
@@ -1453,6 +1484,8 @@ async function handleSessionEnd(userId, event) {
       sender_id: "system",
       content: `${endedByName} ended the ${sessionMode === 'audio' ? 'audio call' : sessionMode === 'video' ? 'video call' : 'chat'}`,
       message_type: "system",
+      system_event: sessionEndedEvent,
+      metadata: sessionEndedMetadata,
       created_at: endedMsgAt,
     });
     await pushToUser(session.mentor_id, {
@@ -1462,6 +1495,8 @@ async function handleSessionEnd(userId, event) {
       sender_id: "system",
       content: `${endedByName} ended the ${sessionMode === 'audio' ? 'audio call' : sessionMode === 'video' ? 'video call' : 'chat'}`,
       message_type: "system",
+      system_event: sessionEndedEvent,
+      metadata: sessionEndedMetadata,
       created_at: endedMsgAt,
     });
     await pushToUser(
@@ -2186,6 +2221,8 @@ async function handleModeSwitchAccept(userId, event) {
     sender_id: "system",
     content: `${closedSegmentType === "chat" ? "Chat" : closedSegmentType === "audio" ? "Audio call" : "Video call"} ended`,
     message_type: "system",
+    system_event: `${closedSegmentType}_ended`,
+    metadata: JSON.stringify({ duration_seconds: closedSegmentDuration }),
     created_at: now,
   };
 
@@ -2196,6 +2233,8 @@ async function handleModeSwitchAccept(userId, event) {
     sender_id: "system",
     content: `${newType === "audio" ? "Audio" : "Video"} call started`,
     message_type: "system",
+    system_event: `${newType}_started`,
+    metadata: null,
     created_at: new Date(Date.now() + 1).toISOString(),
   };
 
@@ -2487,6 +2526,8 @@ const menteeBalance = parseFloat(balanceResult.rows[0].balance);
     sender_id: "system",
     content: `${currentType === "audio" ? "Audio" : "Video"} call ended`,
     message_type: "system",
+    system_event: `${currentType}_ended`,
+    metadata: JSON.stringify({ duration_seconds: callDuration }),
     created_at: now,
   };
 
@@ -2497,6 +2538,8 @@ const menteeBalance = parseFloat(balanceResult.rows[0].balance);
     sender_id: "system",
     content: "Chat started",
     message_type: "system",
+    system_event: "chat_started",
+    metadata: null,
     created_at: new Date(Date.now() + 1).toISOString(),
   };
 
