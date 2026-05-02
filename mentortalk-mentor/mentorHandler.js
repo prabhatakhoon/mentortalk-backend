@@ -664,13 +664,15 @@ async function getSessionDetails(userId, event) {
        s.id, s.mentee_id, s.mentor_id, s.status,
        s.started_at, s.ended_at,
        s.total_amount, s.platform_fee, s.mentor_earning,
+       s.billing_type,
        mtp.first_name AS mentee_first_name,
        mtp.last_name AS mentee_last_name,
        mtp.profile_photo_url AS mentee_avatar
      FROM session s
      JOIN "user" u ON u.id = s.mentee_id
      LEFT JOIN mentee_profile mtp ON mtp.user_id = s.mentee_id
-     WHERE s.id = $1 AND s.mentor_id = $2`,
+     WHERE s.id = $1 AND s.mentor_id = $2
+       AND s.status IN ('completed', 'cancelled', 'rejected', 'timed_out')`,
     [sessionId, userId]
   );
 
@@ -719,11 +721,16 @@ async function getSessionDetails(userId, event) {
     [s.mentee_id]
   );
 
+  const primarySegment = segmentDetails[0] || null;
+
   return respond(200, {
     id: s.id,
     status: s.status,
     started_at: s.started_at,
     ended_at: s.ended_at,
+    session_type: primarySegment ? primarySegment.type : null,
+    rate_per_minute: primarySegment ? primarySegment.rate_per_minute : null,
+    billing_type: s.billing_type || null,
     mentee: {
       id: s.mentee_id,
       name: [s.mentee_first_name, s.mentee_last_name].filter(Boolean).join(" "),
@@ -775,8 +782,9 @@ async function getTransactions(userId, event) {
   const result = await db.query(
     `SELECT
        t.id, t.type, t.direction, t.amount,
-       t.session_id, t.reference_id, t.status, t.created_at,
+       t.session_id, t.reference_id, t.status, t.notes, t.created_at,
        s.started_at AS session_started_at,
+       s.billing_type,
          mtp.first_name AS other_first_name,
        mtp.last_name AS other_last_name,
        mtp.profile_photo_url AS other_avatar
@@ -808,6 +816,8 @@ async function getTransactions(userId, event) {
     session_id: row.session_id,
     reference_id: row.reference_id,
     status: row.status,
+    notes: row.notes || null,
+    billing_type: row.billing_type || null,
     other_user_name: row.other_first_name
     ? [row.other_first_name, row.other_last_name].filter(Boolean).join(" ")
     : null,
