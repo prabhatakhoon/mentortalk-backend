@@ -379,20 +379,20 @@ async function getTransactions(db, userId, queryParams) {
       notes: row.notes || null,
       created_at: row.created_at,
       session_id: row.session_id || null,
-      other_user_name: null,
-      other_user_avatar: null,
+      mentor_name: null,
+      mentor_photo_url: null,
       session_type: row.session_type || null,
       billing_type: row.billing_type || null,
     };
 
     if (row.mentor_first_name) {
-      txn.other_user_name = [row.mentor_first_name, row.mentor_last_name]
+      txn.mentor_name = [row.mentor_first_name, row.mentor_last_name]
         .filter(Boolean)
         .join(" ");
     }
 
     if (row.mentor_photo_key) {
-      txn.other_user_avatar = resolvePhotoUrl(row.mentor_photo_key);
+      txn.mentor_photo_url = resolvePhotoUrl(row.mentor_photo_key);
     }
 
     transactions.push(txn);
