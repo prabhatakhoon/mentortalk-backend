@@ -314,15 +314,32 @@ async function handleGetMessages(userId, event) {
   const sessionId = extractSessionId(event);
   const db = await getPool();
 
-  // Verify user belongs to this session
+  // Verify user belongs to this session and capture role + status for the
+  // mentor download-access gate below.
   const sessionResult = await db.query(
-    `SELECT id FROM session
+    `SELECT id, mentor_id, mentee_id, status FROM session
      WHERE id = $1 AND (mentee_id = $2 OR mentor_id = $2)`,
     [sessionId, userId]
   );
 
   if (sessionResult.rows.length === 0) {
     return respond(404, { error: "Session not found" });
+  }
+
+  const session = sessionResult.rows[0];
+  const requesterIsMentor = session.mentor_id === userId;
+  const isActiveSession = session.status === "active";
+
+  // For mentors viewing a past session, gate media presigning on the mentee's
+  // download-access flag. Mentees always see their own media.
+  let menteePrivacy = null;
+  if (requesterIsMentor && !isActiveSession) {
+    const { rows } = await db.query(
+      `SELECT mentor_download_access
+         FROM mentee_privacy_settings WHERE user_id = $1`,
+      [session.mentee_id]
+    );
+    menteePrivacy = rows[0] || { mentor_download_access: false };
   }
 
   // Parse query params
@@ -357,10 +374,16 @@ async function handleGetMessages(userId, event) {
     };
 
     if (item.media_url) {
-      msg.media_url = await getSignedUrl(s3Client, new GetObjectCommand({
-        Bucket: BUCKET_NAME,
-        Key: item.media_url,
-      }), { expiresIn: 3600 });
+      const allowDownload =
+        !requesterIsMentor || isActiveSession || menteePrivacy?.mentor_download_access;
+      if (allowDownload) {
+        msg.media_url = await getSignedUrl(s3Client, new GetObjectCommand({
+          Bucket: BUCKET_NAME,
+          Key: item.media_url,
+        }), { expiresIn: 3600 });
+      } else {
+        msg.media_url = null;
+      }
     }
     if (item.media_metadata) {
       try {
@@ -879,6 +902,16 @@ system_event: `${sessionType}_started`,
   );
 
   await broadcastPresenceUpdate(userId, "in_session");
+
+  // Snapshot mentee privacy flags for the mentor app to apply FLAG_SECURE on
+  // the chat screen and call overlays from session-start onward.
+  const { rows: privacyRows } = await db.query(
+    `SELECT block_screenshots, block_call_recording
+       FROM mentee_privacy_settings WHERE user_id = $1`,
+    [session.mentee_id]
+  );
+  const menteePrivacy = privacyRows[0] || { block_screenshots: false, block_call_recording: false };
+
   const acceptResponse = {
     session_id: sessionId,
     status: "active",
@@ -889,6 +922,12 @@ system_event: `${sessionType}_started`,
     max_duration_seconds: maxDurationSeconds,
     pref_audio: session.pref_audio ?? true,
     pref_video: session.pref_video ?? true,
+    mentee: {
+      privacy: {
+        block_screenshots: menteePrivacy.block_screenshots,
+        block_call_recording: menteePrivacy.block_call_recording,
+      },
+    },
   };
 
   // Attach Agora credentials for audio/video sessions
