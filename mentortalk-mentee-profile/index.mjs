@@ -106,13 +106,13 @@ async function getClient() {
 // HELPERS
 // ============================================================
 
-async function getUserId(event) {
+async function getAuth(event) {
   try {
     const claims =
       event.requestContext?.authorizer?.claims ||
       event.requestContext?.authorizer ||
       {};
-    if (claims.sub) return claims.sub;
+    if (claims.sub) return { userId: claims.sub, app: claims.app || null };
 
     const authHeader =
       event.headers?.Authorization || event.headers?.authorization || "";
@@ -123,7 +123,8 @@ async function getUserId(event) {
     const secret = await getJwtSecret();
     const payload = jwt.verify(token, secret, { algorithms: ["HS256"] });
 
-    return payload.sub || null;
+    if (!payload.sub) return null;
+    return { userId: payload.sub, app: payload.app || null };
   } catch (err) {
     console.error("[AUTH] JWT verification failed:", err.message);
     return null;
@@ -1057,6 +1058,103 @@ async function getBlockedUsers(db, userId) {
   });
 }
 
+/**
+ * GET /mentee/session/:session_id/details
+ *
+ * Returns full session detail from the mentee's perspective.
+ * Mirror of the mentor's GET /session/:id/details.
+ */
+async function getSessionDetails(db, userId, sessionId) {
+  const sessionResult = await db.query(
+    `SELECT
+       s.id, s.mentee_id, s.mentor_id, s.status,
+       s.started_at, s.ended_at,
+       s.total_amount,
+       s.billing_type,
+       mp.first_name AS mentor_first_name,
+       mp.last_name AS mentor_last_name,
+       mp.profile_photo_url AS mentor_avatar
+     FROM session s
+     LEFT JOIN mentor_profile mp ON mp.user_id = s.mentor_id
+     WHERE s.id = $1
+       AND s.status IN ('completed', 'cancelled', 'rejected', 'timed_out')`,
+    [sessionId]
+  );
+
+  if (sessionResult.rows.length === 0) {
+    return res(404, { message: "Session not found" });
+  }
+
+  const s = sessionResult.rows[0];
+
+  if (s.mentee_id !== userId) {
+    return res(403, { message: "Forbidden" });
+  }
+
+  const segmentsResult = await db.query(
+    `SELECT id, type, rate_per_minute, started_at, ended_at, duration_seconds
+     FROM session_segment
+     WHERE session_id = $1
+     ORDER BY started_at ASC`,
+    [sessionId]
+  );
+
+  const segmentDetails = segmentsResult.rows.map((seg) => {
+    const durationMinutes = Math.ceil((seg.duration_seconds || 0) / 60);
+    return {
+      id: seg.id,
+      type: seg.type,
+      rate_per_minute: parseFloat(seg.rate_per_minute),
+      started_at: seg.started_at,
+      ended_at: seg.ended_at,
+      duration_seconds: seg.duration_seconds,
+      duration_minutes: durationMinutes,
+    };
+  });
+
+  const reviewResult = await db.query(
+    `SELECT rating, comment, created_at
+     FROM review
+     WHERE session_id = $1 AND mentee_id = $2`,
+    [sessionId, userId]
+  );
+
+  const primarySegment = segmentDetails[0] || null;
+
+  return res(200, {
+    id: s.id,
+    status: s.status,
+    started_at: s.started_at,
+    ended_at: s.ended_at,
+    session_type: primarySegment ? primarySegment.type : null,
+    rate_per_minute: primarySegment ? primarySegment.rate_per_minute : null,
+    billing_type: s.billing_type || null,
+    mentor: {
+      id: s.mentor_id,
+      name: [s.mentor_first_name, s.mentor_last_name].filter(Boolean).join(" "),
+      avatar: resolvePhotoUrl(s.mentor_avatar),
+    },
+    segments: segmentDetails,
+    total_duration_seconds: segmentDetails.reduce(
+      (sum, seg) => sum + (seg.duration_seconds || 0),
+      0
+    ),
+    total_duration_minutes: segmentDetails.reduce(
+      (sum, seg) => sum + seg.duration_minutes,
+      0
+    ),
+    total_amount: s.total_amount ? parseFloat(s.total_amount) : 0,
+    review:
+      reviewResult.rows.length > 0
+        ? {
+            rating: parseInt(reviewResult.rows[0].rating),
+            comment: reviewResult.rows[0].comment,
+            created_at: reviewResult.rows[0].created_at,
+          }
+        : null,
+  });
+}
+
 // ============================================================
 // ROUTER
 // ============================================================
@@ -1069,10 +1167,18 @@ export const handler = async (event) => {
     console.log(`[ROUTER] ${method} ${path}`);
 
     // All profile endpoints require auth
-    const userId = await getUserId(event);
-    if (!userId) return res(401, { message: "Unauthorized" });
+    const auth = await getAuth(event);
+    if (!auth) return res(401, { message: "Unauthorized" });
+    const { userId, app } = auth;
 
     const db = await getClient();
+
+    // Mentee session detail
+    const sessionDetailMatch = path.match(/^\/mentee\/session\/([^/]+)\/details$/);
+    if (method === "GET" && sessionDetailMatch) {
+      if (app !== "mentee") return res(403, { message: "Forbidden" });
+      return await getSessionDetails(db, userId, sessionDetailMatch[1]);
+    }
 
     // Photo routes (most specific first)
     if (method === "POST" && path.endsWith("/photo/presign")) {
