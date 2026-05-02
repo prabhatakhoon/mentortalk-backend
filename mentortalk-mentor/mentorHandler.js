@@ -586,6 +586,8 @@ async function getSessions(userId, event) {
           mtp.first_name AS mentee_first_name,
        mtp.last_name AS mentee_last_name,
        mtp.profile_photo_url AS mentee_avatar,
+       COALESCE(mps.block_screenshots, FALSE)    AS block_screenshots,
+       COALESCE(mps.block_call_recording, FALSE) AS block_call_recording,
        array_agg(DISTINCT ss.type) FILTER (WHERE ss.type IS NOT NULL) AS modes,
        COALESCE(SUM(ss.duration_seconds), 0)::int AS total_duration_seconds,
        r.rating AS review_rating,
@@ -593,13 +595,15 @@ async function getSessions(userId, event) {
      FROM session s
      JOIN "user" u ON u.id = s.mentee_id
      LEFT JOIN mentee_profile mtp ON mtp.user_id = s.mentee_id
+     LEFT JOIN mentee_privacy_settings mps ON mps.user_id = s.mentee_id
      LEFT JOIN session_segment ss ON ss.session_id = s.id
      LEFT JOIN review r ON r.session_id = s.id
      LEFT JOIN user_mentorship um ON um.user_id = s.mentee_id AND um.role = 'mentee'
      LEFT JOIN mentorship_category mc ON mc.id = um.mentorship_category_id
      WHERE s.mentor_id = $1
        ${statusFilter}
-     GROUP BY s.id, mtp.first_name, mtp.last_name, mtp.profile_photo_url, r.rating
+     GROUP BY s.id, mtp.first_name, mtp.last_name, mtp.profile_photo_url, r.rating,
+              mps.block_screenshots, mps.block_call_recording
      ORDER BY s.started_at DESC
      LIMIT $2 OFFSET $3`,
     [userId, limit, offset]
@@ -617,6 +621,10 @@ async function getSessions(userId, event) {
       name: [row.mentee_first_name, row.mentee_last_name].filter(Boolean).join(" "),
       avatar: toFullUrl(row.mentee_avatar),
       categories: row.mentee_categories || [],
+      privacy: {
+        block_screenshots: row.block_screenshots,
+        block_call_recording: row.block_call_recording,
+      },
     },
     status: row.status,
     modes: Array.isArray(row.modes) ? row.modes : (row.modes || '').replace(/[{}]/g, '').split(',').filter(Boolean),
@@ -841,14 +849,16 @@ async function getReviews(userId, event) {
       mtp.first_name AS mentee_first_name,
        mtp.last_name AS mentee_last_name,
        mtp.profile_photo_url AS mentee_avatar,
+       COALESCE(mps.show_name_in_reviews, TRUE) AS show_name,
        array_agg(DISTINCT ss.type) FILTER (WHERE ss.type IS NOT NULL) AS modes
      FROM review r
      JOIN session s ON s.id = r.session_id
      JOIN "user" u ON u.id = r.mentee_id
      LEFT JOIN mentee_profile mtp ON mtp.user_id = r.mentee_id
+     LEFT JOIN mentee_privacy_settings mps ON mps.user_id = r.mentee_id
      LEFT JOIN session_segment ss ON ss.session_id = s.id
      WHERE r.mentor_id = $1
-     GROUP BY r.id, s.started_at, mtp.first_name, mtp.last_name, mtp.profile_photo_url
+     GROUP BY r.id, s.started_at, mtp.first_name, mtp.last_name, mtp.profile_photo_url, mps.show_name_in_reviews
      ORDER BY r.created_at DESC
      LIMIT $2 OFFSET $3`,
     [userId, limit, offset]
@@ -866,8 +876,10 @@ async function getReviews(userId, event) {
     session_id: row.session_id,
     session_date: row.session_date,
     mentee: {
-      name: [row.mentee_first_name, row.mentee_last_name].filter(Boolean).join(" "),
-      avatar: toFullUrl(row.mentee_avatar),
+      name: row.show_name
+        ? [row.mentee_first_name, row.mentee_last_name].filter(Boolean).join(" ")
+        : null,
+      avatar: row.show_name ? toFullUrl(row.mentee_avatar) : null,
     },
     modes: Array.isArray(row.modes) ? row.modes : (row.modes || '').replace(/[{}]/g, '').split(',').filter(Boolean),
     created_at: row.created_at,
@@ -1360,22 +1372,27 @@ async function getMentees(userId, event) {
     ? [userId, blockedIds]
     : [userId];
 
-  // 1. Get unique mentees with aggregated session info
+  // 1. Get unique mentees with aggregated session info + privacy snapshot
   const { rows } = await db.query(
     `SELECT
        s.mentee_id,
        mp.first_name,
        mp.last_name,
        mp.profile_photo_url,
+       COALESCE(mps.mentor_chat_access, FALSE) AS mentor_chat_access,
+       COALESCE(mps.block_screenshots, FALSE)  AS block_screenshots,
+       COALESCE(mps.block_call_recording, FALSE) AS block_call_recording,
        COUNT(*)::int AS session_count,
        MAX(COALESCE(s.ended_at, s.started_at)) AS last_session_at
      FROM session s
      JOIN "user" u ON u.id = s.mentee_id
      LEFT JOIN mentee_profile mp ON mp.user_id = s.mentee_id
+     LEFT JOIN mentee_privacy_settings mps ON mps.user_id = s.mentee_id
      WHERE s.mentor_id = $1
        AND s.status = 'completed'
        ${blockedCondition}
-     GROUP BY s.mentee_id, mp.first_name, mp.last_name, mp.profile_photo_url
+     GROUP BY s.mentee_id, mp.first_name, mp.last_name, mp.profile_photo_url,
+              mps.mentor_chat_access, mps.block_screenshots, mps.block_call_recording
      ORDER BY last_session_at DESC
      LIMIT $2 OFFSET $3`,
     queryParams1
@@ -1394,7 +1411,12 @@ async function getMentees(userId, event) {
   // 3. For each mentee, fetch last activity from DynamoDB
   const mentees = await Promise.all(
     rows.map(async (row) => {
-      const lastActivity = await getLastActivity(row.mentee_id, userId, db);
+      const lastActivity = await getLastActivity(
+        row.mentee_id,
+        userId,
+        db,
+        row.mentor_chat_access,
+      );
 
       return {
         mentee_id: row.mentee_id,
@@ -1403,6 +1425,10 @@ async function getMentees(userId, event) {
         session_count: row.session_count,
         last_session_at: row.last_session_at,
         last_activity: lastActivity,
+        privacy: {
+          block_screenshots: row.block_screenshots,
+          block_call_recording: row.block_call_recording,
+        },
       };
     })
   );
@@ -1421,7 +1447,7 @@ async function getMentees(userId, event) {
 // fetches the last meaningful message from DynamoDB.
 // Skips "X ended the chat" to find actual content for preview.
 
-async function getLastActivity(menteeId, mentorId, db) {
+async function getLastActivity(menteeId, mentorId, db, chatAccess = true) {
   const { rows: sessionRows } = await db.query(
     `SELECT id
      FROM session
@@ -1432,7 +1458,7 @@ async function getLastActivity(menteeId, mentorId, db) {
   );
 
   if (sessionRows.length === 0) {
-    return { type: "system", content: "No messages yet" };
+    return { type: "system", content: "No activity yet" };
   }
 
   const lastSessionId = sessionRows[0].id;
@@ -1448,7 +1474,18 @@ async function getLastActivity(menteeId, mentorId, db) {
     }));
 
     if (!result.Items || result.Items.length === 0) {
-      return { type: "system", content: "Session ended" };
+      return { type: "system", content: chatAccess ? "Session ended" : "No activity yet" };
+    }
+
+    // When chat access is OFF, surface the latest system message verbatim
+    // (including "X ended the chat") — content messages are off-limits.
+    if (!chatAccess) {
+      for (const msg of result.Items) {
+        if ((msg.type || "text") === "system") {
+          return { type: "system", content: msg.content || "Session ended" };
+        }
+      }
+      return { type: "system", content: "No activity yet" };
     }
 
     for (const msg of result.Items) {
@@ -1540,9 +1577,17 @@ async function getMenteeMessages(userId, event) {
 
   const db = await getPool();
 
+  // Fetch this mentee's privacy settings up front.
+  const { rows: privacyRows } = await db.query(
+    `SELECT mentor_chat_access, mentor_download_access
+       FROM mentee_privacy_settings WHERE user_id = $1`,
+    [menteeId]
+  );
+  const privacy = privacyRows[0] || { mentor_chat_access: false, mentor_download_access: false };
+
   // 1. Get all completed sessions between this pair
   const { rows: sessionRows } = await db.query(
-    `SELECT id, started_at, ended_at,
+    `SELECT id, status, started_at, ended_at,
             EXTRACT(EPOCH FROM (ended_at - started_at))::int AS duration_seconds
      FROM session
      WHERE mentor_id = $1 AND mentee_id = $2 AND status IN ('completed', 'active')
@@ -1553,6 +1598,9 @@ async function getMenteeMessages(userId, event) {
   if (sessionRows.length === 0) {
     return respond(200, { messages: [], has_more: false });
   }
+
+  const activeSession = sessionRows.find((s) => s.status === 'active');
+  const activeSessionId = activeSession?.id ?? null;
 
   // If cursor exists, skip sessions entirely after cursor time
   const sessionIds = sessionRows.map((r) => r.id);
@@ -1592,21 +1640,38 @@ async function getMenteeMessages(userId, event) {
           const result = await dynamoClient.send(new QueryCommand(queryParams));
 
           for (const item of result.Items || []) {
+            const msgType = item.type || "text";
+            const isActiveSession = sessionId === activeSessionId;
+
+            // Chat access gate: past-session non-system messages are dropped
+            // when the mentee has not granted mentor_chat_access. Active session
+            // is always fully visible.
+            if (!isActiveSession && !privacy.mentor_chat_access && msgType !== "system") {
+              continue;
+            }
+
             const msg = {
               message_id: item.message_id,
               session_id: sessionId,
               sender_id: item.sender_id,
               content: item.content,
-              type: item.type || "text",
+              type: msgType,
               created_at: item.created_at,
               client_message_id: item.client_message_id || null,
             };
 
             if (item.media_url) {
-              msg.media_url = await getSignedUrl(s3Client, new GetObjectCommand({
-                Bucket: BUCKET_NAME,
-                Key: item.media_url,
-              }), { expiresIn: 3600 });
+              // Download access gate: don't presign past-session media when
+              // mentor_download_access is OFF.
+              const allowDownload = isActiveSession || privacy.mentor_download_access;
+              if (allowDownload) {
+                msg.media_url = await getSignedUrl(s3Client, new GetObjectCommand({
+                  Bucket: BUCKET_NAME,
+                  Key: item.media_url,
+                }), { expiresIn: 3600 });
+              } else {
+                msg.media_url = null;
+              }
             }
             if (item.media_metadata) {
               try {
