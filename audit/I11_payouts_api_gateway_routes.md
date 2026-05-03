@@ -33,14 +33,15 @@ Write endpoints return `422 { message: "Validation failed", errors: { field_name
 
 ## IAM / S3 permissions required by the Lambda role
 
-The Lambda needs permission on the `mentortalk-storage-prod` bucket for:
+Verified on 2026-05-03 against role `mentortalk-lambda-role` - all required permissions are already granted via the attached `AmazonS3FullAccess` managed policy. No IAM changes needed for `pan/*`.
 
-- `s3:PutObject` on `pan/*` (already granted if existing presigns work)
-- `s3:GetObject` on `pan/*` (for the GET /mentor/payouts/pan presigned read URL)
-- `s3:HeadObject` on `pan/*` (for PAN PUT existence check)
-- `s3:DeleteObject` on `pan/*` (for replacing old PAN image)
+For reference, the operations used are:
 
-If the existing role only covers `profile-photos/*` and similar prefixes, extend it to include `pan/*`.
+- `s3:PutObject` on `pan/*` - presigned PUT URL (POST /mentor/payouts/pan/image/presign)
+- `s3:GetObject` on `pan/*` - presigned GET URL (GET /mentor/payouts/pan), and also covers HeadObject existence check used by PUT /mentor/payouts/pan (HeadObject is an API operation that requires `s3:GetObject` permission, not a separate IAM action)
+- `s3:DeleteObject` on `pan/*` - cleanup of old PAN image on replacement (PUT /mentor/payouts/pan)
+
+If the role is ever scoped down from `AmazonS3FullAccess` to a tighter custom policy, those three actions on `arn:aws:s3:::mentortalk-storage-prod/pan/*` must be retained.
 
 ## Smoke test order (post-deploy)
 
