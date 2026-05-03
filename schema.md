@@ -204,23 +204,59 @@ Audit trail of admin actions on mentorship applications. Each time an admin appr
 
 ### mentor_payout_account
 
-Stores the mentor's bank account details for receiving payouts. One-to-one with user (unique on user_id). Contains PAN for TDS compliance.
+Stores the mentor's bank account details and PAN for receiving payouts. One-to-one with user (unique on user_id). Contains PAN for TDS compliance under Section 194O. v007 adds verification metadata and a `verification_method` column to support both manual admin review (v1) and automated penny drop (future).
 
-| Column                   | Purpose                                          |
-| ------------------------ | ------------------------------------------------ |
-| id                       | UUID primary key                                 |
-| user_id                  | FK → user.id (unique)                            |
-| account_holder_name      | Name on the bank account                         |
-| account_number           | Bank account number                              |
-| ifsc_code                | IFSC code for NEFT/RTGS                          |
-| bank_name                | Name of the bank                                 |
-| pan_number               | PAN card number (required for TDS)               |
-| pan_document_url         | S3 key for uploaded PAN card image               |
-| pan_verified             | Admin-verified flag                              |
-| razorpay_fund_account_id | Razorpay's fund account ID for automated payouts |
-| created_at, updated_at   | Timestamps                                       |
+| Column                   | Purpose                                                                                                                                                        |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| id                       | UUID primary key                                                                                                                                               |
+| user_id                  | FK → user.id (unique)                                                                                                                                          |
+| account_holder_name      | Name on the bank account                                                                                                                                       |
+| account_number           | Bank account number                                                                                                                                            |
+| ifsc_code                | IFSC code for NEFT/RTGS                                                                                                                                        |
+| bank_name                | Name of the bank (auto-filled client-side from `https://ifsc.razorpay.com/{IFSC}`)                                                                             |
+| pan_number               | PAN card number (required for TDS)                                                                                                                             |
+| pan_document_url         | S3 key for uploaded PAN card image                                                                                                                             |
+| pan_verified             | Boolean — set to TRUE by admin after manual verification                                                                                                       |
+| pan_verified_at          | When PAN was verified                                                                                                                                          |
+| pan_verified_by          | FK → user.id — admin who verified                                                                                                                              |
+| pan_rejection_reason     | Free text — populated when admin rejects PAN. Cleared on next verification attempt.                                                                            |
+| pan_submitted_at         | When mentor first submitted PAN details (or last edited them)                                                                                                  |
+| bank_verified            | Boolean — set to TRUE when admin (or automated mechanism) approves bank account. Resets to FALSE if any bank field is edited.                                  |
+| bank_verified_at         | When bank was verified                                                                                                                                         |
+| bank_verified_by         | FK → user.id — admin who verified                                                                                                                              |
+| bank_rejection_reason    | Free text — populated when admin rejects bank details. Cleared on next verification attempt.                                                                   |
+| bank_submitted_at        | When mentor first submitted bank details (or last edited them)                                                                                                 |
+| verification_method      | How verification is performed: `manual`, `razorpay_forward`, `razorpay_reverse`, `cashfree`, `surepass`, `karza`. Default `manual`. CHECK constraint enforces. |
+| razorpay_fund_account_id | Razorpay's fund account ID for automated payouts. Populated only when `verification_method != 'manual'`.                                                       |
+| created_at, updated_at   | Timestamps. `updated_at` maintained by trigger.                                                                                                                |
+
+**Editing behavior:** when a mentor edits any bank field via `PUT /mentor/payouts/bank`, the backend resets `bank_verified = FALSE` and `bank_verified_at = NULL`, requiring re-verification. Same for PAN. The audit trail of every bank version a mentor has had is preserved in `mentor_bank_account_history` via a database trigger.
 
 This table contains highly sensitive financial data. On deletion, the row should be deleted after the final payout is processed, but PAN and payout records are retained separately in the transaction table for tax compliance.
+
+### mentor_bank_account_history
+
+Audit trail of every bank account version a mentor has had. Whenever bank details on `mentor_payout_account` change, a database trigger closes the previous active row (sets `active_until = NOW()`) and inserts a new active row reflecting the new state. Lets us answer "which bank received the March payout?" even if the mentor changed their account in April.
+
+| Column              | Purpose                                                                                                        |
+| ------------------- | -------------------------------------------------------------------------------------------------------------- |
+| id                  | UUID primary key                                                                                               |
+| mentor_id           | FK → user.id                                                                                                   |
+| account_holder_name | Snapshot of name at the time                                                                                   |
+| account_number      | Full account number (not masked, for legal/dispute resolution). Protect via row-level access in admin queries. |
+| ifsc_code           | Snapshot of IFSC                                                                                               |
+| bank_name           | Snapshot of bank name                                                                                          |
+| verified_at         | When this version was verified (NULL if never verified before being replaced)                                  |
+| verified_by         | FK → user.id — admin who verified                                                                              |
+| verification_method | How this version was verified                                                                                  |
+| active_from         | When this version became active                                                                                |
+| active_until        | When this version was replaced (NULL = currently active)                                                       |
+| changed_by          | FK → user.id — usually the mentor themselves; could be an admin if changed on their behalf                     |
+| created_at          | Timestamp                                                                                                      |
+
+Indexed on `(mentor_id, active_from DESC)` for chronological queries, and on `(mentor_id) WHERE active_until IS NULL` for fast current-active lookups.
+
+The `payout` table's `bank_account_history_id` column points to a specific row here — the exact historical bank account the payout was sent to.
 
 ### mentee_privacy_settings
 
@@ -462,6 +498,47 @@ _Other types observed in production data:_
 - `wallet_credit` — Manual/test credits added directly
 - `balance_correction` — Admin adjustment to fix discrepancies
 - `adjustment` — Bulk balance reset (e.g., test data cleanup)
+- `payout` — debit on mentor wallet when a payout completes. `reference_id = payout.id`.
+- `tds_deduction` — debit on mentor wallet for TDS. Created alongside `payout` debit when TDS is activated. `reference_id = payout.id`. `notes` column records FY and section reference for CA reconciliation.
+
+### payout
+
+Source of truth for payout lifecycle. Each row represents one payout to one mentor for one cycle. Sits between the wallet/transaction ledger (which tracks the wallet math) and the actual money movement (which happens outside the system via NEFT/UPI in v1, or via RazorpayX API later). Snapshots bank/PAN details at row creation so historical payouts remain accurate even if the mentor edits their account later.
+
+| Column                     | Purpose                                                                                                                           |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| id                         | UUID primary key                                                                                                                  |
+| mentor_id                  | FK → user.id                                                                                                                      |
+| wallet_id                  | FK → wallet.id (the mentor's mentor-type wallet)                                                                                  |
+| gross_amount               | numeric — total amount being paid out (mentor wallet debit)                                                                       |
+| tds_amount                 | numeric — TDS deducted under Section 194O. 0 in v1 (deferred). Computed as 0.001 × gross when activated.                          |
+| net_amount                 | numeric — `gross_amount - tds_amount` (actual money sent). CHECK constraint enforces consistency.                                 |
+| period_start, period_end   | The session-completion window this payout covers. Used for idempotency and audit.                                                 |
+| bank_account_holder_name   | Snapshot of mentor's bank details at payout creation                                                                              |
+| bank_account_number_masked | Masked account number (e.g., `XXXXXX1234`) for display                                                                            |
+| bank_account_history_id    | FK → mentor_bank_account_history.id — links to the exact historical bank account this payout was sent to                          |
+| bank_ifsc, bank_name       | Bank metadata snapshot                                                                                                            |
+| upi_id                     | UPI ID snapshot (if payout method is UPI-based). Nullable.                                                                        |
+| pan_number                 | Snapshot of PAN at payout creation. Required for TDS audit. Even if mentor's PAN changes (rare), historical filings stay correct. |
+| method                     | Enum `payout_method`: `manual_neft`, `manual_imps`, `manual_upi`, `razorpay_payout`, `razorpay_link`. Default `manual_neft`.      |
+| status                     | Enum `payout_status`: `pending`, `processing`, `completed`, `failed`. Default `pending`.                                          |
+| utr                        | Bank UTR (manual flow) or Razorpay payout ID (automated flow). Nullable.                                                          |
+| failure_reason             | Free text — populated when status = `failed`                                                                                      |
+| notes                      | Free text — admin notes (e.g., "Sent via HDFC corporate banking")                                                                 |
+| initiated_by               | FK → user.id — admin who clicked "Mark as paid", or system if automated                                                           |
+| initiated_at               | When admin/system initiated the transfer                                                                                          |
+| completed_at               | When status flipped to `completed`                                                                                                |
+| failed_at                  | When status flipped to `failed`                                                                                                   |
+| created_at, updated_at     | Timestamps                                                                                                                        |
+
+**Idempotency:** unique partial index on `(mentor_id, period_start, period_end) WHERE status != 'failed'` prevents duplicate payouts for the same cycle. Failed payouts can be retried (a new row is created with the same period).
+
+**Status lifecycle:**
+
+`pending` → Cron job (EventBridge rule on the 7th of each month) creates the row. Awaiting admin action.
+`processing` → Admin clicked "Mark as paid" and entered UTR (manual flow), or RazorpayX payout API call returned (automated flow). Money is in flight.
+`completed` → Money has settled. Backend creates a `transaction` row debiting the mentor's wallet by `gross_amount` and (when TDS activated) a second `transaction` row for `tds_amount`. Wallet balance updated atomically.
+`failed` → Transfer failed (wrong account, NEFT bounce, insufficient funds in business account). Wallet balance untouched. Admin can retry by creating a new payout row.
 
 **Platform fee split:** The commission split is currently 50/50 (mentor gets 50%, platform takes 50%) and is hardcoded in the session handler Lambda. The split is not stored as a configurable value — it's computed at session end and the resulting amounts are stored in `session.total_amount`, `session.platform_fee`, and `session.mentor_earning`. Video sessions are charged at 1.5× the mentor's base rate.
 
@@ -735,6 +812,24 @@ Used in support_ticket for tracking ticket lifecycle.
 
 Used in support_message to identify who sent a message — the app user, an admin from the panel, or the system (automated boundary markers).
 
+### payout_status
+
+`pending` · `processing` · `completed` · `failed`
+
+Tracks payout lifecycle. See Section 5 for state transitions.
+
+### payout_method
+
+`manual_neft` · `manual_imps` · `manual_upi` · `razorpay_payout` · `razorpay_link`
+
+Records how the payout was (or will be) executed. v1 uses `manual_*` variants. RazorpayX integration adds `razorpay_payout` and `razorpay_link` without schema changes.
+
+### verification_method (text, not formal enum)
+
+`manual` · `razorpay_forward` · `razorpay_reverse` · `cashfree` · `surepass` · `karza`
+
+Stored as TEXT with a CHECK constraint on `mentor_payout_account.verification_method`. Allows new providers to be added without DDL changes.
+
 ---
 
 ## 11. Key Data Flows
@@ -779,6 +874,34 @@ Used in support_message to identify who sent a message — the app user, an admi
 1. Mentee initiates recharge → Razorpay order created.
 2. On payment success (Razorpay payment ID received) → two `transaction` rows: `wallet_topup` credit to mentee wallet, `platform_cash` debit from platform account.
 3. `wallet.balance` incremented atomically.
+
+### Mentor Payout Cycle
+
+1. EventBridge cron runs at 10:00 IST on the 7th of each month, triggering the `mentortalk-generate-payouts` Lambda.
+2. Lambda finds eligible mentors via:
+
+   ```sql
+   SELECT u.id, w.id AS wallet_id, w.balance, mpa.*
+   FROM "user" u
+   JOIN wallet w ON w.user_id = u.id AND w.type = 'mentor'
+   JOIN mentor_payout_account mpa ON mpa.user_id = u.id
+   WHERE w.balance >= :min_threshold        -- e.g., 500
+     AND mpa.bank_verified = TRUE
+     AND mpa.pan_verified = TRUE
+     AND mpa.bank_verified_at < NOW() - INTERVAL '48 hours'  -- cooldown
+     AND u.account_status = 'active';
+   ```
+
+3. For each eligible mentor, creates a `payout` row with `status = 'pending'`, snapshotting bank/PAN/period. Wallet balance NOT debited yet.
+4. Admin opens admin panel's Pending Payouts queue, clicks "Mark as paid" per row.
+5. Admin enters UTR + payment method in the modal. Backend updates `payout`: `status = 'completed'`, `utr`, `completed_at`, `initiated_by`, `method`.
+6. Same transaction creates a `transaction` row: `type = 'payout'`, `direction = 'debit'`, `wallet_id` = mentor wallet, `amount = gross_amount`, `reference_id = payout.id`, `status = 'completed'`. Wallet balance decremented atomically.
+7. (Future, when TDS activated) A second `transaction` row created: `type = 'tds_deduction'`, `direction = 'debit'`, `amount = tds_amount`, `reference_id = payout.id`. CA exports these quarterly for Form 26Q.
+8. Mentor sees the completed payout in their app's Payouts History screen.
+
+**Failure handling:** if admin clicks "Mark as failed" with a reason, payout row gets `status = 'failed'`, `failure_reason`, `failed_at`. No `transaction` row created. Wallet balance remains untouched. Admin can retry by manually triggering a new payout for the same mentor.
+
+**Manual override:** admin panel has a "Generate payouts now" button for off-cycle runs (testing, missed cycle, urgent mentor request). Triggers the same Lambda outside the schedule.
 
 ### Three-Way Split
 
@@ -832,13 +955,15 @@ The split is currently hardcoded at 50/50. The resulting amounts are stored in `
 All foreign key relationships, organized by target table:
 
 **→ user.id** (referenced by 20+ columns across 22 tables):
-`admin_action_log.admin_id`, `admin_action_log.target_user_id`, `block.blocker_id`, `block.blocked_id`, `education.user_id`, `experience.user_id`, `follow.mentee_id`, `follow.mentor_id`, `identity_verification.user_id`, `mentee_profile.user_id`, `mentee_promo_status.user_id`, `mentee_privacy_settings.user_id`, `mentor_free_chat_quota.mentor_id`, `mentor_payout_account.user_id`, `mentor_profile.user_id`, `mentor_quick_reply.user_id`, `mentorship_application.user_id`, `rate_history.user_id`, `refresh_token.user_id`, `report.reporter_id`, `report.reported_id`, `report.reviewed_by`, `review.mentor_id`, `review.mentee_id`, `review_history.reviewer_id`, `session.mentor_id`, `session.mentee_id`, `support_ticket.user_id`, `support_ticket.resolved_by`, `support_message.user_id`, `support_message.sender_id`, `transaction.user_id`, `user_language.user_id`, `user_mentorship.user_id`, `wallet.user_id`
+`admin_action_log.admin_id`, `admin_action_log.target_user_id`, `block.blocker_id`, `block.blocked_id`, `education.user_id`, `experience.user_id`, `follow.mentee_id`, `follow.mentor_id`, `identity_verification.user_id`, `mentee_profile.user_id`, `mentee_promo_status.user_id`, `mentee_privacy_settings.user_id`, `mentor_bank_account_history.mentor_id`, `mentor_bank_account_history.verified_by`, `mentor_bank_account_history.changed_by`, `mentor_free_chat_quota.mentor_id`, `mentor_payout_account.user_id`, `mentor_payout_account.bank_verified_by`, `mentor_payout_account.pan_verified_by`, `mentor_profile.user_id`, `mentor_quick_reply.user_id`, `mentorship_application.user_id`, `payout.mentor_id`, `payout.initiated_by`, `rate_history.user_id`, `refresh_token.user_id`, `report.reporter_id`, `report.reported_id`, `report.reviewed_by`, `review.mentor_id`, `review.mentee_id`, `review_history.reviewer_id`, `session.mentor_id`, `session.mentee_id`, `support_ticket.user_id`, `support_ticket.resolved_by`, `support_message.user_id`, `support_message.sender_id`, `transaction.user_id`, `user_language.user_id`, `user_mentorship.user_id`, `wallet.user_id`
 
 **→ session.id**: `review.session_id`, `session_segment.session_id`, `transaction.session_id`, `mentee_promo_status.free_chat_session_id`, `mentee_promo_status.intro_session_id`
 
 **→ support_ticket.id**: `support_message.ticket_id`
 
-**→ wallet.id**: `transaction.wallet_id`
+**→ wallet.id**: `transaction.wallet_id`, `payout.wallet_id`
+
+**→ mentor_bank_account_history.id**: `payout.bank_account_history_id`
 
 **→ mentorship_application.id**: `review_history.application_id`
 
