@@ -3,7 +3,7 @@ import pg from "pg";
 import jwt from "jsonwebtoken";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, QueryCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
-import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const s3Client = new S3Client({ region: "ap-south-1" });
@@ -95,6 +95,75 @@ async function pushToUser(userId, payload) {
   } catch (err) {
     console.log(`Push to ${userId} failed: ${err.message}`);
   }
+}
+
+// ─── Payouts Helpers ─────────────────────────────────────────
+
+const respond422 = (errors) =>
+  respond(422, { message: "Validation failed", errors });
+
+async function requireApprovedMentor(db, userId) {
+  const result = await db.query(
+    `SELECT submission_status FROM mentorship_application WHERE user_id = $1`,
+    [userId]
+  );
+  if (result.rows[0]?.submission_status !== "approved") {
+    return respond(403, {
+      error: "MENTOR_NOT_APPROVED",
+      message: "Complete mentor onboarding to set up payouts.",
+    });
+  }
+  return null;
+}
+
+function maskAccountNumber(accountNumber) {
+  if (!accountNumber || accountNumber.length <= 4) return accountNumber;
+  return "X".repeat(accountNumber.length - 4) + accountNumber.slice(-4);
+}
+
+function maskPan(pan) {
+  if (!pan || pan.length !== 10) return pan;
+  return pan.slice(0, 5) + "****" + pan.slice(9);
+}
+
+function normalizePan(s) {
+  if (typeof s !== "string") return s;
+  return s.replace(/\s+/g, "").toUpperCase();
+}
+
+function normalizeAccountNumber(s) {
+  if (typeof s !== "string") return s;
+  return s.replace(/\D/g, "");
+}
+
+function encodeCursor(row) {
+  if (!row) return null;
+  const payload = JSON.stringify({
+    created_at: row.created_at instanceof Date
+      ? row.created_at.toISOString()
+      : row.created_at,
+    id: row.id,
+  });
+  return Buffer.from(payload).toString("base64");
+}
+
+function decodeCursor(s) {
+  if (!s) return null;
+  try {
+    const decoded = JSON.parse(Buffer.from(s, "base64").toString("utf8"));
+    if (!decoded.created_at || !decoded.id) return null;
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+// not_submitted | pending_review | verified | action_required
+function derivePayoutFieldStatus(rowExists, fieldValue, verified, rejectionReason) {
+  if (!rowExists || fieldValue == null) return "not_submitted";
+  if (verified) return "verified";
+  if (rejectionReason) return "action_required";
+  return "pending_review";
 }
 
 // ─── Route Handler ───────────────────────────────────────────
@@ -200,7 +269,30 @@ export const handler = async (event) => {
     if (method === "DELETE" && path.match(/\/mentor\/quick-replies\/[^/]+$/)) {
       return await deleteQuickReply(userId, event);
     }
-  
+
+    // ─── Payouts ────────────────────────────────────────────
+    if (method === "GET" && path === "/mentor/payouts/summary") {
+      return await getPayoutsSummary(userId);
+    }
+    if (method === "GET" && path === "/mentor/payouts/bank") {
+      return await getPayoutsBank(userId);
+    }
+    if (method === "PUT" && path === "/mentor/payouts/bank") {
+      return await putPayoutsBank(userId, event);
+    }
+    if (method === "GET" && path === "/mentor/payouts/pan") {
+      return await getPayoutsPan(userId);
+    }
+    if (method === "POST" && path === "/mentor/payouts/pan/image/presign") {
+      return await payoutsPanImagePresign(userId, event);
+    }
+    if (method === "PUT" && path === "/mentor/payouts/pan") {
+      return await putPayoutsPan(userId, event);
+    }
+    if (method === "GET" && path === "/mentor/payouts") {
+      return await getPayoutsList(userId, event);
+    }
+
       return respond(404, { error: "Not found" });
   } catch (err) {
     if (err.name === "JsonWebTokenError" || err.name === "TokenExpiredError" || err.message.includes("authorization header")) {
@@ -1908,4 +2000,397 @@ async function deleteQuickReply(userId, event) {
   }
 
   return respond(200, { deleted: true });
+}
+
+// ─── GET /mentor/payouts/summary ─────────────────────────────
+
+async function getPayoutsSummary(userId) {
+  const db = await getPool();
+  const result = await db.query(
+    `SELECT account_number, ifsc_code, bank_verified, bank_rejection_reason,
+            pan_number, pan_verified, pan_rejection_reason
+     FROM mentor_payout_account WHERE user_id = $1`,
+    [userId]
+  );
+
+  const row = result.rows[0];
+  const rowExists = !!row;
+
+  const bankStatus = derivePayoutFieldStatus(
+    rowExists,
+    row?.account_number,
+    row?.bank_verified,
+    row?.bank_rejection_reason
+  );
+  const panStatus = derivePayoutFieldStatus(
+    rowExists,
+    row?.pan_number,
+    row?.pan_verified,
+    row?.pan_rejection_reason
+  );
+
+  return respond(200, {
+    bank: {
+      status: bankStatus,
+      ifsc: row?.ifsc_code || null,
+      account_last4: row?.account_number ? row.account_number.slice(-4) : null,
+      rejection_reason: row?.bank_rejection_reason || null,
+    },
+    pan: {
+      status: panStatus,
+      pan_masked: row?.pan_number ? maskPan(row.pan_number) : null,
+      rejection_reason: row?.pan_rejection_reason || null,
+    },
+  });
+}
+
+// ─── GET /mentor/payouts/bank ────────────────────────────────
+
+async function getPayoutsBank(userId) {
+  const db = await getPool();
+  const result = await db.query(
+    `SELECT account_holder_name, account_number, ifsc_code, bank_name,
+            bank_verified, bank_rejection_reason, bank_submitted_at
+     FROM mentor_payout_account WHERE user_id = $1`,
+    [userId]
+  );
+
+  const row = result.rows[0];
+  if (!row || !row.account_number) {
+    return respond(404, { error: "Bank account not submitted" });
+  }
+
+  const status = derivePayoutFieldStatus(
+    true,
+    row.account_number,
+    row.bank_verified,
+    row.bank_rejection_reason
+  );
+
+  return respond(200, {
+    account_holder_name: row.account_holder_name,
+    account_number_masked: maskAccountNumber(row.account_number),
+    ifsc: row.ifsc_code,
+    bank_name: row.bank_name,
+    status,
+    rejection_reason: row.bank_rejection_reason || null,
+    submitted_at: row.bank_submitted_at,
+  });
+}
+
+// ─── PUT /mentor/payouts/bank ────────────────────────────────
+
+async function putPayoutsBank(userId, event) {
+  const db = await getPool();
+
+  const gate = await requireApprovedMentor(db, userId);
+  if (gate) return gate;
+
+  const body = JSON.parse(event.body || "{}");
+  const accountHolderName =
+    typeof body.account_holder_name === "string"
+      ? body.account_holder_name.trim()
+      : body.account_holder_name;
+  const accountNumber = normalizeAccountNumber(body.account_number);
+  const ifsc =
+    typeof body.ifsc === "string" ? body.ifsc.trim().toUpperCase() : body.ifsc;
+  const bankName =
+    typeof body.bank_name === "string" ? body.bank_name.trim() : body.bank_name;
+
+  const errors = {};
+  if (
+    !accountHolderName ||
+    typeof accountHolderName !== "string" ||
+    accountHolderName.length < 2 ||
+    accountHolderName.length > 100 ||
+    !/^[A-Za-z .']+$/.test(accountHolderName)
+  ) {
+    errors.account_holder_name = [
+      "Must be 2-100 characters, only letters, spaces, dots, and apostrophes",
+    ];
+  }
+  if (!accountNumber || !/^\d{7,18}$/.test(accountNumber)) {
+    errors.account_number = ["Must be 7-18 digits"];
+  }
+  if (!ifsc || !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) {
+    errors.ifsc = ["Invalid IFSC format"];
+  }
+  if (
+    !bankName ||
+    typeof bankName !== "string" ||
+    bankName.length < 2 ||
+    bankName.length > 100
+  ) {
+    errors.bank_name = ["Must be 2-100 characters"];
+  }
+  if (Object.keys(errors).length > 0) {
+    return respond422(errors);
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO mentor_payout_account (
+         user_id, account_holder_name, account_number, ifsc_code, bank_name,
+         bank_verified, bank_verified_at, bank_verified_by, bank_rejection_reason, bank_submitted_at
+       ) VALUES ($1, $2, $3, $4, $5, FALSE, NULL, NULL, NULL, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET
+         account_holder_name = EXCLUDED.account_holder_name,
+         account_number = EXCLUDED.account_number,
+         ifsc_code = EXCLUDED.ifsc_code,
+         bank_name = EXCLUDED.bank_name,
+         bank_verified = FALSE,
+         bank_verified_at = NULL,
+         bank_verified_by = NULL,
+         bank_rejection_reason = NULL,
+         bank_submitted_at = NOW(),
+         updated_at = NOW()`,
+      [userId, accountHolderName, accountNumber, ifsc, bankName]
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  console.log(
+    `bank_saved userId=${userId} ifsc=${ifsc} account_last4=${accountNumber.slice(-4)}`
+  );
+
+  return await getPayoutsBank(userId);
+}
+
+// ─── GET /mentor/payouts/pan ─────────────────────────────────
+
+async function getPayoutsPan(userId) {
+  const db = await getPool();
+  const result = await db.query(
+    `SELECT pan_number, pan_document_url, pan_verified,
+            pan_rejection_reason, pan_submitted_at
+     FROM mentor_payout_account WHERE user_id = $1`,
+    [userId]
+  );
+
+  const row = result.rows[0];
+  if (!row || !row.pan_number) {
+    return respond(404, { error: "PAN not submitted" });
+  }
+
+  let panImageUrl = null;
+  if (row.pan_document_url) {
+    const command = new GetObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: row.pan_document_url,
+    });
+    panImageUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+  }
+
+  const status = derivePayoutFieldStatus(
+    true,
+    row.pan_number,
+    row.pan_verified,
+    row.pan_rejection_reason
+  );
+
+  return respond(200, {
+    pan_number_masked: maskPan(row.pan_number),
+    pan_image_url: panImageUrl,
+    status,
+    rejection_reason: row.pan_rejection_reason || null,
+    submitted_at: row.pan_submitted_at,
+  });
+}
+
+// ─── POST /mentor/payouts/pan/image/presign ──────────────────
+
+async function payoutsPanImagePresign(userId, event) {
+  const db = await getPool();
+
+  const gate = await requireApprovedMentor(db, userId);
+  if (gate) return gate;
+
+  const body = JSON.parse(event.body || "{}");
+  const { file_name, content_type } = body;
+
+  const errors = {};
+  const allowedTypes = ["image/jpeg", "image/png", "application/pdf"];
+  if (!content_type || !allowedTypes.includes(content_type)) {
+    errors.content_type = ["Must be one of: image/jpeg, image/png, application/pdf"];
+  }
+  if (
+    !file_name ||
+    typeof file_name !== "string" ||
+    file_name.length < 1 ||
+    file_name.length > 255
+  ) {
+    errors.file_name = ["Must be 1-255 characters"];
+  }
+  if (Object.keys(errors).length > 0) {
+    return respond422(errors);
+  }
+
+  const ext = file_name.split(".").pop().toLowerCase();
+  const s3Key = `pan/${userId}/${crypto.randomUUID()}.${ext}`;
+
+  const command = new PutObjectCommand({
+    Bucket: BUCKET_NAME,
+    Key: s3Key,
+    ContentType: content_type,
+  });
+  const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 300 });
+
+  console.log(`presign_pan userId=${userId} content_type=${content_type}`);
+
+  return respond(200, {
+    upload_url: uploadUrl,
+    s3_key: s3Key,
+    expires_in: 300,
+  });
+}
+
+// ─── PUT /mentor/payouts/pan ─────────────────────────────────
+
+async function putPayoutsPan(userId, event) {
+  const db = await getPool();
+
+  const gate = await requireApprovedMentor(db, userId);
+  if (gate) return gate;
+
+  const body = JSON.parse(event.body || "{}");
+  const panNumber = normalizePan(body.pan_number);
+  const s3Key =
+    typeof body.pan_image_s3_key === "string"
+      ? body.pan_image_s3_key.trim()
+      : body.pan_image_s3_key;
+
+  const errors = {};
+  if (!panNumber || !/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(panNumber)) {
+    errors.pan_number = ["Must be a valid 10-character PAN (ABCDE1234X)"];
+  }
+
+  const expectedPrefix = `pan/${userId}/`;
+  if (!s3Key || typeof s3Key !== "string" || !s3Key.startsWith(expectedPrefix)) {
+    errors.pan_image_s3_key = ["Invalid image key"];
+  }
+
+  if (Object.keys(errors).length > 0) {
+    return respond422(errors);
+  }
+
+  try {
+    await s3Client.send(
+      new HeadObjectCommand({ Bucket: BUCKET_NAME, Key: s3Key })
+    );
+  } catch (err) {
+    return respond422({
+      pan_image_s3_key: ["Image upload not found, please re-upload"],
+    });
+  }
+
+  const existing = await db.query(
+    `SELECT pan_document_url FROM mentor_payout_account WHERE user_id = $1`,
+    [userId]
+  );
+  const oldPanKey = existing.rows[0]?.pan_document_url || null;
+
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO mentor_payout_account (
+         user_id, pan_number, pan_document_url,
+         pan_verified, pan_verified_at, pan_verified_by, pan_rejection_reason, pan_submitted_at
+       ) VALUES ($1, $2, $3, FALSE, NULL, NULL, NULL, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET
+         pan_number = EXCLUDED.pan_number,
+         pan_document_url = EXCLUDED.pan_document_url,
+         pan_verified = FALSE,
+         pan_verified_at = NULL,
+         pan_verified_by = NULL,
+         pan_rejection_reason = NULL,
+         pan_submitted_at = NOW(),
+         updated_at = NOW()`,
+      [userId, panNumber, s3Key]
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  if (oldPanKey && oldPanKey !== s3Key) {
+    try {
+      await s3Client.send(
+        new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: oldPanKey })
+      );
+    } catch (e) {
+      console.warn("Failed to delete old PAN image:", e.message);
+    }
+  }
+
+  console.log(`pan_saved userId=${userId} pan_masked=${maskPan(panNumber)}`);
+
+  return await getPayoutsPan(userId);
+}
+
+// ─── GET /mentor/payouts ─────────────────────────────────────
+
+async function getPayoutsList(userId, event) {
+  const db = await getPool();
+  const params = event.queryStringParameters || {};
+
+  let limit = parseInt(params.limit, 10);
+  if (!Number.isFinite(limit) || limit <= 0) limit = 20;
+  if (limit > 50) limit = 50;
+
+  const cursor = decodeCursor(params.cursor);
+  const cursorTs = cursor?.created_at || null;
+  const cursorId = cursor?.id || null;
+
+  const result = await db.query(
+    `SELECT id, gross_amount, tds_amount, net_amount, status, method,
+            bank_account_number_masked, bank_name, utr,
+            initiated_at, completed_at, failure_reason, created_at
+     FROM payout
+     WHERE mentor_id = $1
+       AND ($2::timestamptz IS NULL OR (created_at, id) < ($2::timestamptz, $3::uuid))
+     ORDER BY created_at DESC, id DESC
+     LIMIT $4`,
+    [userId, cursorTs, cursorId, limit + 1]
+  );
+
+  const rows = result.rows;
+  const hasMore = rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  const nextCursor = hasMore ? encodeCursor(pageRows[pageRows.length - 1]) : null;
+
+  const items = pageRows.map((r) => {
+    const masked = r.bank_account_number_masked || "";
+    const last4 = masked.length >= 4 ? masked.slice(-4) : null;
+    return {
+      id: r.id,
+      amount_paisa: Math.round(parseFloat(r.gross_amount) * 100),
+      tds_paisa: Math.round(parseFloat(r.tds_amount) * 100),
+      net_paisa: Math.round(parseFloat(r.net_amount) * 100),
+      status: r.status,
+      method: r.method,
+      bank_account_last4: last4,
+      bank_name: r.bank_name,
+      utr: r.utr,
+      initiated_at: r.initiated_at,
+      completed_at: r.completed_at,
+      failure_reason: r.failure_reason,
+    };
+  });
+
+  return respond(200, {
+    items,
+    has_more: hasMore,
+    next_cursor: nextCursor,
+  });
 }
