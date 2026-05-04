@@ -145,6 +145,81 @@ async function pushToUser(userId, payload, fcmOptions = null) {
 }
 
 // ============================================================
+// Payout helpers
+// ============================================================
+
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+const presignS3 = async (key, expiresIn = 3600) => {
+  if (!key) return null;
+  const command = new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key });
+  return getSignedUrl(s3Client, command, { expiresIn });
+};
+
+const last4 = (str) => (str ? String(str).slice(-4) : "");
+
+// Previous calendar month range, computed in IST and returned as UTC Dates.
+const getPreviousMonthRangeIST = (asOfDate) => {
+  const ist = new Date(asOfDate.getTime() + IST_OFFSET_MS);
+  const year = ist.getUTCFullYear();
+  const month = ist.getUTCMonth();
+  const startIST = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0));
+  const endIST = new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
+  return {
+    period_start: new Date(startIST.getTime() - IST_OFFSET_MS),
+    period_end: new Date(endIST.getTime() - IST_OFFSET_MS),
+  };
+};
+
+// Indian financial year (April 1 to March 31), determined in IST.
+const getCurrentFY = (now = new Date()) => {
+  const ist = new Date(now.getTime() + IST_OFFSET_MS);
+  const year = ist.getUTCFullYear();
+  const month = ist.getUTCMonth();
+  const fyStartYear = month >= 3 ? year : year - 1;
+  const fyEndYear = fyStartYear + 1;
+  const fyStartIST = new Date(Date.UTC(fyStartYear, 3, 1, 0, 0, 0, 0));
+  return {
+    label: `${fyStartYear}-${String(fyEndYear).slice(2)}`,
+    start: new Date(fyStartIST.getTime() - IST_OFFSET_MS),
+  };
+};
+
+// Calendar-month range in IST → UTC, given a YYYY-MM string.
+const getMonthRangeIST = (yyyymm) => {
+  const [yy, mm] = yyyymm.split("-").map(Number);
+  const startIST = new Date(Date.UTC(yy, mm - 1, 1, 0, 0, 0, 0));
+  const endIST = new Date(Date.UTC(yy, mm, 0, 23, 59, 59, 999));
+  return {
+    start: new Date(startIST.getTime() - IST_OFFSET_MS),
+    end: new Date(endIST.getTime() - IST_OFFSET_MS),
+  };
+};
+
+const serializePayoutRow = (r, fullAccountNumber = null) => ({
+  id: r.id,
+  mentor_id: r.mentor_id,
+  amount_paisa: Math.round(parseFloat(r.gross_amount) * 100),
+  tds_paisa: Math.round(parseFloat(r.tds_amount) * 100),
+  net_paisa: Math.round(parseFloat(r.net_amount) * 100),
+  status: r.status,
+  method: r.method,
+  bank: {
+    account_holder_name: r.bank_account_holder_name,
+    account_number: fullAccountNumber || r.bank_account_number_masked,
+    ifsc: r.bank_ifsc,
+    bank_name: r.bank_name,
+  },
+  pan_number: r.pan_number,
+  period_start: r.period_start,
+  period_end: r.period_end,
+  created_at: r.created_at,
+  utr: r.utr,
+  completed_at: r.completed_at,
+  failure_reason: r.failure_reason,
+});
+
+// ============================================================
 // Handlers
 // ============================================================
 
@@ -1311,6 +1386,1249 @@ const handlers = {
       body: { message: "Ticket resolved", ticket_id: ticketId },
     };
   },
+
+  // ──────────────────────────────────────────────────────────
+  // GET /admin/payouts/dashboard
+  // ──────────────────────────────────────────────────────────
+  payoutsDashboard: async () => {
+    const db = await getPool();
+
+    const now = new Date();
+    const ist = new Date(now.getTime() + IST_OFFSET_MS);
+    const monthStartIST = new Date(
+      Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), 1, 0, 0, 0, 0),
+    );
+    const monthStartUTC = new Date(monthStartIST.getTime() - IST_OFFSET_MS);
+
+    const [bankCount, panCount, pendingPayouts, completed, failed, lastGen] =
+      await Promise.all([
+        db.query(
+          `SELECT COUNT(*)::int AS count FROM mentor_payout_account
+           WHERE account_number IS NOT NULL
+             AND bank_verified = FALSE
+             AND bank_rejection_reason IS NULL`,
+        ),
+        db.query(
+          `SELECT COUNT(*)::int AS count FROM mentor_payout_account
+           WHERE pan_number IS NOT NULL
+             AND pan_verified = FALSE
+             AND pan_rejection_reason IS NULL`,
+        ),
+        db.query(
+          `SELECT COUNT(*)::int AS count FROM payout WHERE status = 'pending'`,
+        ),
+        db.query(
+          `SELECT COUNT(*)::int AS count, COALESCE(SUM(gross_amount), 0) AS total
+           FROM payout
+           WHERE status = 'completed' AND completed_at >= $1`,
+          [monthStartUTC],
+        ),
+        db.query(
+          `SELECT COUNT(*)::int AS count
+           FROM payout
+           WHERE status = 'failed' AND failed_at >= $1`,
+          [monthStartUTC],
+        ),
+        db.query(
+          `SELECT created_at, metadata
+           FROM admin_action_log
+           WHERE action = 'payouts_generated'
+           ORDER BY created_at DESC LIMIT 1`,
+        ),
+      ]);
+
+    let last_generation = null;
+    if (lastGen.rows.length > 0) {
+      const md = lastGen.rows[0].metadata || {};
+      let coveredPeriod = null;
+      if (md.period_start) {
+        const ps = new Date(md.period_start);
+        const psIst = new Date(ps.getTime() + IST_OFFSET_MS);
+        coveredPeriod = `${psIst.getUTCFullYear()}-${String(psIst.getUTCMonth() + 1).padStart(2, "0")}`;
+      }
+      last_generation = {
+        ran_at: lastGen.rows[0].created_at,
+        payouts_created: md.payouts_created || 0,
+        covered_period: coveredPeriod,
+      };
+    }
+
+    return {
+      statusCode: 200,
+      body: {
+        pending_verifications: {
+          bank: bankCount.rows[0].count,
+          pan: panCount.rows[0].count,
+        },
+        pending_payouts: pendingPayouts.rows[0].count,
+        completed_this_month: {
+          count: completed.rows[0].count,
+          total_paisa: Math.round(parseFloat(completed.rows[0].total) * 100),
+        },
+        failed_this_month: failed.rows[0].count,
+        last_generation,
+      },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // GET /admin/payouts/verifications/pending?type=bank|pan
+  // ──────────────────────────────────────────────────────────
+  payoutsVerificationsPending: async (queryParams) => {
+    const db = await getPool();
+    const type = queryParams.type;
+    if (type !== "bank" && type !== "pan") {
+      return {
+        statusCode: 400,
+        body: { error: "type must be 'bank' or 'pan'" },
+      };
+    }
+    const limit = Math.min(parseInt(queryParams.limit || "20"), 50);
+    const offset = parseInt(queryParams.offset || "0");
+
+    const isBank = type === "bank";
+    const filter = isBank
+      ? "mpa.account_number IS NOT NULL AND mpa.bank_verified = FALSE AND mpa.bank_rejection_reason IS NULL"
+      : "mpa.pan_number IS NOT NULL AND mpa.pan_verified = FALSE AND mpa.pan_rejection_reason IS NULL";
+    const orderCol = isBank ? "mpa.bank_submitted_at" : "mpa.pan_submitted_at";
+
+    const totalQ = await db.query(
+      `SELECT COUNT(*)::int AS total FROM mentor_payout_account mpa WHERE ${filter}`,
+    );
+    const total = totalQ.rows[0].total;
+
+    const result = await db.query(
+      `SELECT
+         u.id AS user_id,
+         u.phone_number,
+         NULLIF(TRIM(CONCAT(mp.first_name, ' ', mp.last_name)), '') AS mentor_name,
+         iv.aadhaar_verified,
+         iv.selfie_url AS selfie_key,
+         mpa.bank_submitted_at,
+         mpa.pan_submitted_at,
+         mpa.account_holder_name,
+         mpa.account_number,
+         mpa.ifsc_code,
+         mpa.bank_name,
+         mpa.bank_verified,
+         mpa.pan_number,
+         mpa.pan_document_url AS pan_key,
+         mpa.pan_verified
+       FROM mentor_payout_account mpa
+       JOIN "user" u ON u.id = mpa.user_id
+       LEFT JOIN mentor_profile mp ON mp.user_id = u.id
+       LEFT JOIN identity_verification iv ON iv.user_id = u.id
+       WHERE ${filter}
+       ORDER BY ${orderCol} ASC NULLS LAST, u.id ASC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset],
+    );
+
+    const items = await Promise.all(
+      result.rows.map(async (r) => {
+        const item = {
+          user_id: r.user_id,
+          mentor_name: r.mentor_name,
+          mentor_phone: r.phone_number,
+          aadhaar_verified: r.aadhaar_verified || false,
+          selfie_url: await presignS3(r.selfie_key, 3600),
+          submitted_at: isBank ? r.bank_submitted_at : r.pan_submitted_at,
+          bank: null,
+          pan: null,
+          cross_reference: {
+            verified_pan_number: null,
+            verified_pan_image_url: null,
+            verified_bank: null,
+          },
+        };
+        if (isBank) {
+          item.bank = {
+            account_holder_name: r.account_holder_name,
+            account_number: r.account_number,
+            ifsc: r.ifsc_code,
+            bank_name: r.bank_name,
+          };
+          if (r.pan_verified) {
+            item.cross_reference.verified_pan_number = r.pan_number;
+            item.cross_reference.verified_pan_image_url = await presignS3(
+              r.pan_key,
+              3600,
+            );
+          }
+        } else {
+          item.pan = {
+            pan_number: r.pan_number,
+            pan_image_url: await presignS3(r.pan_key, 3600),
+          };
+          if (r.bank_verified) {
+            item.cross_reference.verified_bank = {
+              account_holder_name: r.account_holder_name,
+              account_number: r.account_number,
+              ifsc: r.ifsc_code,
+              bank_name: r.bank_name,
+            };
+          }
+        }
+        return item;
+      }),
+    );
+
+    return {
+      statusCode: 200,
+      body: {
+        items,
+        total,
+        has_more: offset + limit < total,
+      },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/payouts/verifications/:user_id/bank/approve
+  // ──────────────────────────────────────────────────────────
+  payoutsBankApprove: async (userId, body) => {
+    const reviewerId = body.reviewer_id;
+    if (!reviewerId) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    const db = await getPool();
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      const sel = await client.query(
+        `SELECT account_number, ifsc_code, bank_verified
+         FROM mentor_payout_account WHERE user_id = $1 FOR UPDATE`,
+        [userId],
+      );
+      if (sel.rows.length === 0 || !sel.rows[0].account_number) {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 400,
+          body: { error: "Mentor has not submitted bank details" },
+        };
+      }
+      if (sel.rows[0].bank_verified) {
+        await client.query("ROLLBACK");
+        return { statusCode: 400, body: { error: "Bank already verified" } };
+      }
+
+      await client.query(
+        `UPDATE mentor_payout_account
+         SET bank_verified = TRUE,
+             bank_verified_at = NOW(),
+             bank_verified_by = $2,
+             bank_rejection_reason = NULL,
+             verification_method = 'manual'
+         WHERE user_id = $1`,
+        [userId, reviewerId],
+      );
+
+      // Trigger only fires on bank-field changes; verification-only updates
+      // require a direct UPDATE of the active history row.
+      await client.query(
+        `UPDATE mentor_bank_account_history
+         SET verified_at = NOW(),
+             verified_by = $2,
+             verification_method = 'manual'
+         WHERE mentor_id = $1 AND active_until IS NULL`,
+        [userId, reviewerId],
+      );
+
+      await client.query(
+        `INSERT INTO admin_action_log (admin_id, target_user_id, action, metadata)
+         VALUES ($1, $2, 'payout_bank_verified', $3)`,
+        [
+          reviewerId,
+          userId,
+          JSON.stringify({
+            ifsc: sel.rows[0].ifsc_code,
+            account_last4: last4(sel.rows[0].account_number),
+          }),
+        ],
+      );
+
+      await client.query("COMMIT");
+
+      return {
+        statusCode: 200,
+        body: {
+          message: "Bank verified",
+          user_id: userId,
+          bank_verified: true,
+          bank_verified_at: new Date().toISOString(),
+        },
+      };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/payouts/verifications/:user_id/bank/reject
+  // ──────────────────────────────────────────────────────────
+  payoutsBankReject: async (userId, body) => {
+    const { reviewer_id, reason } = body;
+    if (!reviewer_id) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    if (!reason || typeof reason !== "string") {
+      return { statusCode: 400, body: { error: "reason is required" } };
+    }
+    const trimmed = reason.trim();
+    if (trimmed.length < 5 || trimmed.length > 500) {
+      return {
+        statusCode: 400,
+        body: { error: "Reason must be 5-500 characters" },
+      };
+    }
+
+    const db = await getPool();
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      const sel = await client.query(
+        `SELECT account_number FROM mentor_payout_account WHERE user_id = $1 FOR UPDATE`,
+        [userId],
+      );
+      if (sel.rows.length === 0 || !sel.rows[0].account_number) {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 400,
+          body: { error: "Mentor has not submitted bank details" },
+        };
+      }
+
+      await client.query(
+        `UPDATE mentor_payout_account
+         SET bank_verified = FALSE,
+             bank_verified_at = NULL,
+             bank_verified_by = NULL,
+             bank_rejection_reason = $2
+         WHERE user_id = $1`,
+        [userId, trimmed],
+      );
+
+      await client.query(
+        `INSERT INTO admin_action_log (admin_id, target_user_id, action, reason, metadata)
+         VALUES ($1, $2, 'payout_bank_rejected', $3, $4)`,
+        [
+          reviewer_id,
+          userId,
+          "Bank rejected",
+          JSON.stringify({ reason: trimmed }),
+        ],
+      );
+
+      await client.query("COMMIT");
+
+      return {
+        statusCode: 200,
+        body: {
+          message: "Bank rejected",
+          user_id: userId,
+          bank_rejection_reason: trimmed,
+        },
+      };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/payouts/verifications/:user_id/pan/approve
+  // ──────────────────────────────────────────────────────────
+  payoutsPanApprove: async (userId, body) => {
+    const reviewerId = body.reviewer_id;
+    if (!reviewerId) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    const db = await getPool();
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      const sel = await client.query(
+        `SELECT pan_number, pan_verified
+         FROM mentor_payout_account WHERE user_id = $1 FOR UPDATE`,
+        [userId],
+      );
+      if (sel.rows.length === 0 || !sel.rows[0].pan_number) {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 400,
+          body: { error: "Mentor has not submitted PAN" },
+        };
+      }
+      if (sel.rows[0].pan_verified) {
+        await client.query("ROLLBACK");
+        return { statusCode: 400, body: { error: "PAN already verified" } };
+      }
+
+      await client.query(
+        `UPDATE mentor_payout_account
+         SET pan_verified = TRUE,
+             pan_verified_at = NOW(),
+             pan_verified_by = $2,
+             pan_rejection_reason = NULL
+         WHERE user_id = $1`,
+        [userId, reviewerId],
+      );
+
+      await client.query(
+        `INSERT INTO admin_action_log (admin_id, target_user_id, action, metadata)
+         VALUES ($1, $2, 'payout_pan_verified', $3)`,
+        [
+          reviewerId,
+          userId,
+          JSON.stringify({ pan_number: sel.rows[0].pan_number }),
+        ],
+      );
+
+      await client.query("COMMIT");
+
+      return {
+        statusCode: 200,
+        body: {
+          message: "PAN verified",
+          user_id: userId,
+          pan_verified: true,
+          pan_verified_at: new Date().toISOString(),
+        },
+      };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/payouts/verifications/:user_id/pan/reject
+  // ──────────────────────────────────────────────────────────
+  payoutsPanReject: async (userId, body) => {
+    const { reviewer_id, reason } = body;
+    if (!reviewer_id) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    if (!reason || typeof reason !== "string") {
+      return { statusCode: 400, body: { error: "reason is required" } };
+    }
+    const trimmed = reason.trim();
+    if (trimmed.length < 5 || trimmed.length > 500) {
+      return {
+        statusCode: 400,
+        body: { error: "Reason must be 5-500 characters" },
+      };
+    }
+
+    const db = await getPool();
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      const sel = await client.query(
+        `SELECT pan_number FROM mentor_payout_account WHERE user_id = $1 FOR UPDATE`,
+        [userId],
+      );
+      if (sel.rows.length === 0 || !sel.rows[0].pan_number) {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 400,
+          body: { error: "Mentor has not submitted PAN" },
+        };
+      }
+
+      await client.query(
+        `UPDATE mentor_payout_account
+         SET pan_verified = FALSE,
+             pan_verified_at = NULL,
+             pan_verified_by = NULL,
+             pan_rejection_reason = $2
+         WHERE user_id = $1`,
+        [userId, trimmed],
+      );
+
+      await client.query(
+        `INSERT INTO admin_action_log (admin_id, target_user_id, action, reason, metadata)
+         VALUES ($1, $2, 'payout_pan_rejected', $3, $4)`,
+        [
+          reviewer_id,
+          userId,
+          "PAN rejected",
+          JSON.stringify({ reason: trimmed }),
+        ],
+      );
+
+      await client.query("COMMIT");
+
+      return {
+        statusCode: 200,
+        body: {
+          message: "PAN rejected",
+          user_id: userId,
+          pan_rejection_reason: trimmed,
+        },
+      };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // GET /admin/payouts/queue
+  // ──────────────────────────────────────────────────────────
+  payoutsQueue: async (queryParams) => {
+    const db = await getPool();
+    const status = queryParams.status || "pending";
+    const validStatuses = ["pending", "processing", "completed", "failed"];
+    if (!validStatuses.includes(status)) {
+      return { statusCode: 400, body: { error: "Invalid status" } };
+    }
+    const limit = Math.min(parseInt(queryParams.limit || "20"), 50);
+    const offset = parseInt(queryParams.offset || "0");
+
+    const filters = ["p.status = $1::payout_status"];
+    const params = [status];
+    let idx = 2;
+
+    if (queryParams.month) {
+      if (!/^\d{4}-\d{2}$/.test(queryParams.month)) {
+        return {
+          statusCode: 400,
+          body: { error: "month must be YYYY-MM" },
+        };
+      }
+      const range = getMonthRangeIST(queryParams.month);
+      filters.push(
+        `p.period_start >= $${idx} AND p.period_end <= $${idx + 1}`,
+      );
+      params.push(range.start, range.end);
+      idx += 2;
+    }
+
+    const where = "WHERE " + filters.join(" AND ");
+
+    const totalRes = await db.query(
+      `SELECT COUNT(*)::int AS total FROM payout p ${where}`,
+      params,
+    );
+
+    const listRes = await db.query(
+      `SELECT
+         p.*,
+         h.account_number AS full_account_number,
+         u.phone_number,
+         NULLIF(TRIM(CONCAT(mp.first_name, ' ', mp.last_name)), '') AS mentor_name
+       FROM payout p
+       LEFT JOIN mentor_bank_account_history h ON h.id = p.bank_account_history_id
+       JOIN "user" u ON u.id = p.mentor_id
+       LEFT JOIN mentor_profile mp ON mp.user_id = p.mentor_id
+       ${where}
+       ORDER BY p.created_at DESC, p.id DESC
+       LIMIT $${idx} OFFSET $${idx + 1}`,
+      [...params, limit, offset],
+    );
+
+    return {
+      statusCode: 200,
+      body: {
+        items: listRes.rows.map((r) => ({
+          ...serializePayoutRow(r, r.full_account_number),
+          mentor_name: r.mentor_name,
+          mentor_phone: r.phone_number,
+        })),
+        total: totalRes.rows[0].total,
+        has_more: offset + limit < totalRes.rows[0].total,
+      },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/payouts/:payout_id/mark-paid
+  // ──────────────────────────────────────────────────────────
+  payoutsMarkPaid: async (payoutId, body) => {
+    const { reviewer_id, utr, method, notes } = body;
+    if (!reviewer_id) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    if (!utr || typeof utr !== "string") {
+      return { statusCode: 400, body: { error: "utr is required" } };
+    }
+    if (utr.length < 5 || utr.length > 30 || !/^[a-zA-Z0-9]+$/.test(utr)) {
+      return {
+        statusCode: 400,
+        body: { error: "UTR must be 5-30 alphanumeric characters" },
+      };
+    }
+    const validMethods = ["manual_neft", "manual_imps", "manual_upi"];
+    if (!validMethods.includes(method)) {
+      return {
+        statusCode: 400,
+        body: {
+          error: "method must be manual_neft, manual_imps, or manual_upi",
+        },
+      };
+    }
+    if (notes && typeof notes === "string" && notes.length > 500) {
+      return { statusCode: 400, body: { error: "notes max 500 characters" } };
+    }
+
+    const db = await getPool();
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      const payoutRes = await client.query(
+        `SELECT id, mentor_id, wallet_id, gross_amount, status,
+                bank_name, bank_account_number_masked
+         FROM payout WHERE id = $1 FOR UPDATE`,
+        [payoutId],
+      );
+      if (payoutRes.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return { statusCode: 404, body: { error: "Payout not found" } };
+      }
+      const payout = payoutRes.rows[0];
+      if (!["pending", "processing"].includes(payout.status)) {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 400,
+          body: { error: `Payout already ${payout.status}` },
+        };
+      }
+
+      const last4Digits = last4(payout.bank_account_number_masked);
+      const methodLabel = method.replace("manual_", "").toUpperCase();
+      const txnNotes = `${methodLabel} to ${payout.bank_name || "bank"} ****${last4Digits}, UTR: ${utr}`;
+
+      await client.query(
+        `UPDATE payout
+         SET status = 'completed',
+             utr = $2,
+             method = $3::payout_method,
+             notes = $4,
+             completed_at = NOW(),
+             initiated_by = $5,
+             initiated_at = NOW()
+         WHERE id = $1`,
+        [payoutId, utr, method, notes || null, reviewer_id],
+      );
+
+      await client.query(
+        `INSERT INTO transaction (user_id, wallet_id, type, direction, amount, reference_id, status, notes)
+         VALUES ($1, $2, 'payout', 'debit', $3, $4, 'completed', $5)`,
+        [
+          payout.mentor_id,
+          payout.wallet_id,
+          payout.gross_amount,
+          payoutId,
+          txnNotes,
+        ],
+      );
+
+      const walletRes = await client.query(
+        `UPDATE wallet
+         SET balance = balance - $2, updated_at = NOW()
+         WHERE id = $1
+         RETURNING balance`,
+        [payout.wallet_id, payout.gross_amount],
+      );
+      const newBalance = parseFloat(walletRes.rows[0].balance);
+      if (newBalance < 0) {
+        throw new Error(
+          `Wallet balance would go negative (${newBalance}) for payout ${payoutId}`,
+        );
+      }
+
+      await client.query(
+        `INSERT INTO admin_action_log (admin_id, target_user_id, action, metadata)
+         VALUES ($1, $2, 'payout_completed', $3)`,
+        [
+          reviewer_id,
+          payout.mentor_id,
+          JSON.stringify({
+            payout_id: payoutId,
+            utr,
+            amount_paisa: Math.round(parseFloat(payout.gross_amount) * 100),
+          }),
+        ],
+      );
+
+      await client.query("COMMIT");
+
+      return {
+        statusCode: 200,
+        body: {
+          message: "Payout marked as paid",
+          payout_id: payoutId,
+          status: "completed",
+          utr,
+          method,
+          completed_at: new Date().toISOString(),
+          wallet_balance_paisa: Math.round(newBalance * 100),
+        },
+      };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/payouts/:payout_id/mark-failed
+  // ──────────────────────────────────────────────────────────
+  payoutsMarkFailed: async (payoutId, body) => {
+    const { reviewer_id, reason, method } = body;
+    if (!reviewer_id) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    if (!reason || typeof reason !== "string") {
+      return { statusCode: 400, body: { error: "reason is required" } };
+    }
+    const trimmed = reason.trim();
+    if (trimmed.length < 5 || trimmed.length > 500) {
+      return {
+        statusCode: 400,
+        body: { error: "Reason must be 5-500 characters" },
+      };
+    }
+    const validMethods = ["manual_neft", "manual_imps", "manual_upi"];
+    if (!validMethods.includes(method)) {
+      return {
+        statusCode: 400,
+        body: {
+          error: "method must be manual_neft, manual_imps, or manual_upi",
+        },
+      };
+    }
+
+    const db = await getPool();
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      const payoutRes = await client.query(
+        `SELECT id, mentor_id, status FROM payout WHERE id = $1 FOR UPDATE`,
+        [payoutId],
+      );
+      if (payoutRes.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return { statusCode: 404, body: { error: "Payout not found" } };
+      }
+      const payout = payoutRes.rows[0];
+      if (!["pending", "processing"].includes(payout.status)) {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 400,
+          body: { error: `Payout already ${payout.status}` },
+        };
+      }
+
+      await client.query(
+        `UPDATE payout
+         SET status = 'failed',
+             failure_reason = $2,
+             failed_at = NOW(),
+             initiated_by = $3,
+             method = $4::payout_method
+         WHERE id = $1`,
+        [payoutId, trimmed, reviewer_id, method],
+      );
+
+      await client.query(
+        `INSERT INTO admin_action_log (admin_id, target_user_id, action, metadata)
+         VALUES ($1, $2, 'payout_failed', $3)`,
+        [
+          reviewer_id,
+          payout.mentor_id,
+          JSON.stringify({ payout_id: payoutId, reason: trimmed }),
+        ],
+      );
+
+      await client.query("COMMIT");
+
+      return {
+        statusCode: 200,
+        body: {
+          message: "Payout marked as failed",
+          payout_id: payoutId,
+          status: "failed",
+          failure_reason: trimmed,
+        },
+      };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/payouts/:payout_id/retry
+  // ──────────────────────────────────────────────────────────
+  payoutsRetry: async (payoutId, body) => {
+    const { reviewer_id } = body;
+    if (!reviewer_id) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+
+    const db = await getPool();
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      const orig = await client.query(
+        `SELECT id, mentor_id, wallet_id, gross_amount, tds_amount, net_amount,
+                period_start, period_end, status
+         FROM payout WHERE id = $1 FOR UPDATE`,
+        [payoutId],
+      );
+      if (orig.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return { statusCode: 404, body: { error: "Payout not found" } };
+      }
+      const o = orig.rows[0];
+      if (o.status !== "failed") {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 400,
+          body: { error: "Can only retry failed payouts" },
+        };
+      }
+
+      const acc = await client.query(
+        `SELECT account_holder_name, account_number, ifsc_code, bank_name, pan_number,
+                (SELECT id FROM mentor_bank_account_history h
+                 WHERE h.mentor_id = $1 AND h.active_until IS NULL
+                 ORDER BY active_from DESC LIMIT 1) AS bank_history_id
+         FROM mentor_payout_account WHERE user_id = $1`,
+        [o.mentor_id],
+      );
+      if (
+        acc.rows.length === 0 ||
+        !acc.rows[0].account_number ||
+        !acc.rows[0].pan_number
+      ) {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 400,
+          body: {
+            error: "Mentor's current bank/PAN incomplete — cannot retry",
+          },
+        };
+      }
+      const a = acc.rows[0];
+      const masked =
+        "X".repeat(Math.max(a.account_number.length - 4, 0)) +
+        a.account_number.slice(-4);
+
+      const newPayout = await client.query(
+        `INSERT INTO payout (
+           mentor_id, wallet_id, gross_amount, tds_amount, net_amount,
+           period_start, period_end,
+           bank_account_holder_name, bank_account_number_masked, bank_account_history_id,
+           bank_ifsc, bank_name, pan_number,
+           method, status
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'manual_neft', 'pending')
+         RETURNING id, created_at`,
+        [
+          o.mentor_id,
+          o.wallet_id,
+          o.gross_amount,
+          o.tds_amount,
+          o.net_amount,
+          o.period_start,
+          o.period_end,
+          a.account_holder_name,
+          masked,
+          a.bank_history_id,
+          a.ifsc_code,
+          a.bank_name,
+          a.pan_number,
+        ],
+      );
+      const newId = newPayout.rows[0].id;
+
+      await client.query(
+        `INSERT INTO admin_action_log (admin_id, target_user_id, action, metadata)
+         VALUES ($1, $2, 'payout_retry', $3)`,
+        [
+          reviewer_id,
+          o.mentor_id,
+          JSON.stringify({
+            original_payout_id: payoutId,
+            new_payout_id: newId,
+          }),
+        ],
+      );
+
+      await client.query("COMMIT");
+
+      return {
+        statusCode: 201,
+        body: {
+          message: "Payout retried",
+          original_payout_id: payoutId,
+          new_payout_id: newId,
+          status: "pending",
+        },
+      };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/payouts/generate-now
+  // ──────────────────────────────────────────────────────────
+  payoutsGenerateNow: async (body) => {
+    const { reviewer_id } = body;
+    if (!reviewer_id) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+
+    const minThresholdPaisa =
+      body.min_threshold_paisa !== undefined
+        ? parseInt(body.min_threshold_paisa)
+        : 50000;
+    if (isNaN(minThresholdPaisa) || minThresholdPaisa < 0) {
+      return {
+        statusCode: 400,
+        body: { error: "min_threshold_paisa must be a non-negative integer" },
+      };
+    }
+    const minThresholdRupees = minThresholdPaisa / 100;
+
+    let asOfDate;
+    if (body.as_of_date) {
+      asOfDate = new Date(body.as_of_date);
+      if (isNaN(asOfDate.getTime())) {
+        return {
+          statusCode: 400,
+          body: { error: "as_of_date must be a valid ISO date" },
+        };
+      }
+    } else {
+      asOfDate = new Date();
+    }
+    const { period_start, period_end } = getPreviousMonthRangeIST(asOfDate);
+
+    const db = await getPool();
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      const baseEligibleFrom = `
+        FROM "user" u
+        JOIN wallet w ON w.user_id = u.id AND w.type = 'mentor'
+        JOIN mentor_payout_account mpa ON mpa.user_id = u.id
+        WHERE u.account_status = 'active'
+      `;
+
+      const [
+        belowThresholdQ,
+        unverifiedBankQ,
+        unverifiedPanQ,
+        cooldownQ,
+        alreadyGenQ,
+      ] = await Promise.all([
+        client.query(
+          `SELECT COUNT(*)::int AS count ${baseEligibleFrom}
+           AND mpa.bank_verified = TRUE AND mpa.pan_verified = TRUE
+           AND w.balance < $1`,
+          [minThresholdRupees],
+        ),
+        client.query(
+          `SELECT COUNT(*)::int AS count ${baseEligibleFrom}
+           AND mpa.account_number IS NOT NULL
+           AND mpa.bank_verified = FALSE
+           AND w.balance >= $1`,
+          [minThresholdRupees],
+        ),
+        client.query(
+          `SELECT COUNT(*)::int AS count ${baseEligibleFrom}
+           AND mpa.pan_number IS NOT NULL
+           AND mpa.pan_verified = FALSE
+           AND w.balance >= $1`,
+          [minThresholdRupees],
+        ),
+        client.query(
+          `SELECT COUNT(*)::int AS count ${baseEligibleFrom}
+           AND mpa.bank_verified = TRUE AND mpa.pan_verified = TRUE
+           AND mpa.bank_verified_at >= NOW() - INTERVAL '48 hours'
+           AND w.balance >= $1`,
+          [minThresholdRupees],
+        ),
+        client.query(
+          `SELECT COUNT(*)::int AS count ${baseEligibleFrom}
+           AND mpa.bank_verified = TRUE AND mpa.pan_verified = TRUE
+           AND mpa.bank_verified_at < NOW() - INTERVAL '48 hours'
+           AND w.balance >= $1
+           AND EXISTS (
+             SELECT 1 FROM payout p
+             WHERE p.mentor_id = u.id
+               AND p.period_start = $2 AND p.period_end = $3
+               AND p.status != 'failed'
+           )`,
+          [minThresholdRupees, period_start, period_end],
+        ),
+      ]);
+
+      const insertRes = await client.query(
+        `WITH eligible AS (
+           SELECT
+             u.id AS mentor_id,
+             w.id AS wallet_id,
+             w.balance,
+             mpa.account_holder_name,
+             mpa.account_number,
+             mpa.ifsc_code,
+             mpa.bank_name,
+             mpa.pan_number,
+             (SELECT id FROM mentor_bank_account_history h
+              WHERE h.mentor_id = u.id AND h.active_until IS NULL
+              ORDER BY active_from DESC LIMIT 1) AS bank_history_id
+           FROM "user" u
+           JOIN wallet w ON w.user_id = u.id AND w.type = 'mentor'
+           JOIN mentor_payout_account mpa ON mpa.user_id = u.id
+           WHERE w.balance >= $1
+             AND mpa.bank_verified = TRUE
+             AND mpa.pan_verified = TRUE
+             AND mpa.bank_verified_at < NOW() - INTERVAL '48 hours'
+             AND u.account_status = 'active'
+             AND NOT EXISTS (
+               SELECT 1 FROM payout p
+               WHERE p.mentor_id = u.id
+                 AND p.period_start = $2
+                 AND p.period_end = $3
+                 AND p.status != 'failed'
+             )
+         )
+         INSERT INTO payout (
+           mentor_id, wallet_id, gross_amount, tds_amount, net_amount,
+           period_start, period_end,
+           bank_account_holder_name, bank_account_number_masked, bank_account_history_id,
+           bank_ifsc, bank_name, pan_number,
+           method, status
+         )
+         SELECT
+           mentor_id, wallet_id, balance, 0, balance,
+           $2, $3,
+           account_holder_name,
+           REPEAT('X', GREATEST(LENGTH(account_number) - 4, 0)) || RIGHT(account_number, 4),
+           bank_history_id,
+           ifsc_code, bank_name, pan_number,
+           'manual_neft', 'pending'
+         FROM eligible
+         RETURNING id, mentor_id, gross_amount, bank_account_number_masked`,
+        [minThresholdRupees, period_start, period_end],
+      );
+
+      for (const r of insertRes.rows) {
+        console.log(
+          `[PAYOUTS] Created payout ${r.id} mentor=${r.mentor_id} gross=${r.gross_amount} acc=${r.bank_account_number_masked}`,
+        );
+      }
+
+      const skipped = {
+        below_threshold: belowThresholdQ.rows[0].count,
+        unverified_bank: unverifiedBankQ.rows[0].count,
+        unverified_pan: unverifiedPanQ.rows[0].count,
+        cooldown_active: cooldownQ.rows[0].count,
+        already_generated_for_period: alreadyGenQ.rows[0].count,
+      };
+
+      const meta = {
+        payouts_created: insertRes.rows.length,
+        skipped,
+        as_of_date: body.as_of_date || null,
+        min_threshold_paisa: minThresholdPaisa,
+        period_start: period_start.toISOString(),
+        period_end: period_end.toISOString(),
+      };
+
+      await client.query(
+        `INSERT INTO admin_action_log (admin_id, target_user_id, action, metadata)
+         VALUES ($1, NULL, 'payouts_generated', $2)`,
+        [reviewer_id, JSON.stringify(meta)],
+      );
+
+      await client.query("COMMIT");
+
+      return {
+        statusCode: 200,
+        body: {
+          payouts_created: insertRes.rows.length,
+          period: {
+            start: period_start.toISOString(),
+            end: period_end.toISOString(),
+          },
+          skipped,
+        },
+      };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // GET /admin/payouts/mentor/:user_id
+  // ──────────────────────────────────────────────────────────
+  payoutsMentorDetail: async (userId, queryParams) => {
+    const db = await getPool();
+    const limit = Math.min(parseInt(queryParams.limit || "20"), 50);
+    const offset = parseInt(queryParams.offset || "0");
+
+    const userRes = await db.query(
+      `SELECT u.id, u.phone_number, u.account_status,
+              NULLIF(TRIM(CONCAT(mp.first_name, ' ', mp.last_name)), '') AS name
+       FROM "user" u
+       LEFT JOIN mentor_profile mp ON mp.user_id = u.id
+       WHERE u.id = $1`,
+      [userId],
+    );
+    if (userRes.rows.length === 0) {
+      return { statusCode: 404, body: { error: "Mentor not found" } };
+    }
+
+    const fy = getCurrentFY();
+
+    const [walletRes, accRes, historyRes, payoutTotalRes, payoutListRes, fyRes] =
+      await Promise.all([
+        db.query(
+          `SELECT balance FROM wallet WHERE user_id = $1 AND type = 'mentor'`,
+          [userId],
+        ),
+        db.query(
+          `SELECT account_holder_name, account_number, ifsc_code, bank_name,
+                  bank_verified, bank_verified_at, bank_verified_by,
+                  bank_rejection_reason, bank_submitted_at,
+                  pan_number, pan_document_url,
+                  pan_verified, pan_verified_at, pan_verified_by,
+                  pan_rejection_reason, pan_submitted_at
+           FROM mentor_payout_account WHERE user_id = $1`,
+          [userId],
+        ),
+        db.query(
+          `SELECT id, account_holder_name, account_number, ifsc_code, bank_name,
+                  verified_at, verified_by, verification_method,
+                  active_from, active_until, changed_by
+           FROM mentor_bank_account_history
+           WHERE mentor_id = $1
+           ORDER BY active_from DESC`,
+          [userId],
+        ),
+        db.query(
+          `SELECT COUNT(*)::int AS total FROM payout WHERE mentor_id = $1`,
+          [userId],
+        ),
+        db.query(
+          `SELECT p.*, h.account_number AS full_account_number
+           FROM payout p
+           LEFT JOIN mentor_bank_account_history h
+             ON h.id = p.bank_account_history_id
+           WHERE p.mentor_id = $1
+           ORDER BY p.created_at DESC, p.id DESC
+           LIMIT $2 OFFSET $3`,
+          [userId, limit, offset],
+        ),
+        db.query(
+          `SELECT
+             COALESCE(SUM(total_amount), 0) AS gross_facilitated,
+             COALESCE(SUM(mentor_earning), 0) AS mentor_earned
+           FROM session
+           WHERE mentor_id = $1
+             AND status = 'completed'
+             AND started_at >= $2`,
+          [userId, fy.start],
+        ),
+      ]);
+
+    const acc = accRes.rows[0] || {};
+    const walletBalance = parseFloat(walletRes.rows[0]?.balance ?? 0);
+    const fyGross = parseFloat(fyRes.rows[0].gross_facilitated);
+    const fyEarned = parseFloat(fyRes.rows[0].mentor_earned);
+    const panImageUrl = await presignS3(acc.pan_document_url, 3600);
+
+    const total = payoutTotalRes.rows[0].total;
+
+    return {
+      statusCode: 200,
+      body: {
+        mentor: {
+          user_id: userRes.rows[0].id,
+          name: userRes.rows[0].name,
+          phone: userRes.rows[0].phone_number,
+          approval_status: userRes.rows[0].account_status,
+          wallet_balance_paisa: Math.round(walletBalance * 100),
+          fy_gross_facilitated_paisa: Math.round(fyGross * 100),
+          fy_mentor_earned_paisa: Math.round(fyEarned * 100),
+          fy_year: fy.label,
+        },
+        current_bank: {
+          account_holder_name: acc.account_holder_name || null,
+          account_number: acc.account_number || null,
+          ifsc: acc.ifsc_code || null,
+          bank_name: acc.bank_name || null,
+          verified: acc.bank_verified || false,
+          verified_at: acc.bank_verified_at || null,
+          verified_by: acc.bank_verified_by || null,
+          rejection_reason: acc.bank_rejection_reason || null,
+          submitted_at: acc.bank_submitted_at || null,
+        },
+        current_pan: {
+          pan_number: acc.pan_number || null,
+          pan_image_url: panImageUrl,
+          verified: acc.pan_verified || false,
+          verified_at: acc.pan_verified_at || null,
+          verified_by: acc.pan_verified_by || null,
+          rejection_reason: acc.pan_rejection_reason || null,
+          submitted_at: acc.pan_submitted_at || null,
+        },
+        bank_history: historyRes.rows.map((h) => ({
+          id: h.id,
+          account_holder_name: h.account_holder_name,
+          account_number: h.account_number,
+          ifsc: h.ifsc_code,
+          bank_name: h.bank_name,
+          verified_at: h.verified_at,
+          verified_by: h.verified_by,
+          verification_method: h.verification_method,
+          active_from: h.active_from,
+          active_until: h.active_until,
+          changed_by: h.changed_by,
+        })),
+        payouts: {
+          items: payoutListRes.rows.map((r) =>
+            serializePayoutRow(r, r.full_account_number),
+          ),
+          total,
+          has_more: offset + limit < total,
+        },
+      },
+    };
+  },
 };
 
 // ============================================================
@@ -1473,6 +2791,114 @@ export const handler = async (event) => {
     );
     if (resolveMatch && method === "POST") {
       result = await handlers.resolveTicket(resolveMatch[1], body);
+      return respond(result);
+    }
+
+    // ── Payouts ────────────────────────────────────────────
+
+    // GET /admin/payouts/dashboard
+    if (path.match(/\/admin\/payouts\/dashboard\/?$/) && method === "GET") {
+      result = await handlers.payoutsDashboard();
+      return respond(result);
+    }
+
+    // GET /admin/payouts/verifications/pending
+    if (
+      path.match(/\/admin\/payouts\/verifications\/pending\/?$/) &&
+      method === "GET"
+    ) {
+      const queryParams = event.queryStringParameters || {};
+      result = await handlers.payoutsVerificationsPending(queryParams);
+      return respond(result);
+    }
+
+    // POST /admin/payouts/verifications/:user_id/bank/approve
+    const bankApproveMatch = path.match(
+      /\/admin\/payouts\/verifications\/([\w-]+)\/bank\/approve$/,
+    );
+    if (bankApproveMatch && method === "POST") {
+      result = await handlers.payoutsBankApprove(bankApproveMatch[1], body);
+      return respond(result);
+    }
+
+    // POST /admin/payouts/verifications/:user_id/bank/reject
+    const bankRejectMatch = path.match(
+      /\/admin\/payouts\/verifications\/([\w-]+)\/bank\/reject$/,
+    );
+    if (bankRejectMatch && method === "POST") {
+      result = await handlers.payoutsBankReject(bankRejectMatch[1], body);
+      return respond(result);
+    }
+
+    // POST /admin/payouts/verifications/:user_id/pan/approve
+    const panApproveMatch = path.match(
+      /\/admin\/payouts\/verifications\/([\w-]+)\/pan\/approve$/,
+    );
+    if (panApproveMatch && method === "POST") {
+      result = await handlers.payoutsPanApprove(panApproveMatch[1], body);
+      return respond(result);
+    }
+
+    // POST /admin/payouts/verifications/:user_id/pan/reject
+    const panRejectMatch = path.match(
+      /\/admin\/payouts\/verifications\/([\w-]+)\/pan\/reject$/,
+    );
+    if (panRejectMatch && method === "POST") {
+      result = await handlers.payoutsPanReject(panRejectMatch[1], body);
+      return respond(result);
+    }
+
+    // GET /admin/payouts/queue
+    if (path.match(/\/admin\/payouts\/queue\/?$/) && method === "GET") {
+      const queryParams = event.queryStringParameters || {};
+      result = await handlers.payoutsQueue(queryParams);
+      return respond(result);
+    }
+
+    // POST /admin/payouts/generate-now
+    if (
+      path.match(/\/admin\/payouts\/generate-now\/?$/) &&
+      method === "POST"
+    ) {
+      result = await handlers.payoutsGenerateNow(body);
+      return respond(result);
+    }
+
+    // GET /admin/payouts/mentor/:user_id
+    const mentorDetailMatch = path.match(
+      /\/admin\/payouts\/mentor\/([\w-]+)$/,
+    );
+    if (mentorDetailMatch && method === "GET") {
+      const queryParams = event.queryStringParameters || {};
+      result = await handlers.payoutsMentorDetail(
+        mentorDetailMatch[1],
+        queryParams,
+      );
+      return respond(result);
+    }
+
+    // POST /admin/payouts/:payout_id/mark-paid
+    const markPaidMatch = path.match(
+      /\/admin\/payouts\/([\w-]+)\/mark-paid$/,
+    );
+    if (markPaidMatch && method === "POST") {
+      result = await handlers.payoutsMarkPaid(markPaidMatch[1], body);
+      return respond(result);
+    }
+
+    // POST /admin/payouts/:payout_id/mark-failed
+    const markFailedMatch = path.match(
+      /\/admin\/payouts\/([\w-]+)\/mark-failed$/,
+    );
+    if (markFailedMatch && method === "POST") {
+      result = await handlers.payoutsMarkFailed(markFailedMatch[1], body);
+      return respond(result);
+    }
+
+    // POST /admin/payouts/:payout_id/retry
+    const retryMatch = path.match(/\/admin\/payouts\/([\w-]+)\/retry$/);
+    if (retryMatch && method === "POST") {
+      result = await handlers.payoutsRetry(retryMatch[1], body);
       return respond(result);
     }
 
