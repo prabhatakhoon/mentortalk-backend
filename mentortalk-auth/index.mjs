@@ -104,7 +104,7 @@ const generateTokens = async (user, appConfig) => {
 
   const db = await getPool();
   await db.query(
-    `INSERT INTO refresh_token (user_id, token_hash, expires_at) VALUES ($1, $2, NOW() + INTERVAL '30 days')`,
+    `INSERT INTO refresh_token (user_id, token_hash, expires_at) VALUES ($1, $2, NOW() + INTERVAL '1 year')`,
     [user.id, refreshTokenHash],
   );
 
