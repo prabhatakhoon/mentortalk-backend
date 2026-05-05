@@ -196,6 +196,16 @@ const getMonthRangeIST = (yyyymm) => {
   };
 };
 
+// Mirrors mentor-facing derivePayoutFieldStatus in mentortalk-mentor/mentorHandler.js.
+// Keep in sync — mentor app and admin panel must agree on the four-state model.
+// not_submitted | pending_review | verified | action_required
+const derivePayoutFieldStatus = (fieldValue, verified, rejectionReason) => {
+  if (fieldValue == null) return "not_submitted";
+  if (verified) return "verified";
+  if (rejectionReason) return "action_required";
+  return "pending_review";
+};
+
 const serializePayoutRow = (r, fullAccountNumber = null) => ({
   id: r.id,
   mentor_id: r.mentor_id,
@@ -1400,42 +1410,62 @@ const handlers = {
     );
     const monthStartUTC = new Date(monthStartIST.getTime() - IST_OFFSET_MS);
 
-    const [bankCount, panCount, pendingPayouts, completed, failed, lastGen] =
-      await Promise.all([
-        db.query(
-          `SELECT COUNT(*)::int AS count FROM mentor_payout_account
+    const [
+      bankCount,
+      panCount,
+      bankActionRequired,
+      panActionRequired,
+      pendingPayouts,
+      completed,
+      failed,
+      lastGen,
+    ] = await Promise.all([
+      db.query(
+        `SELECT COUNT(*)::int AS count FROM mentor_payout_account
            WHERE account_number IS NOT NULL
              AND bank_verified = FALSE
              AND bank_rejection_reason IS NULL`,
-        ),
-        db.query(
-          `SELECT COUNT(*)::int AS count FROM mentor_payout_account
+      ),
+      db.query(
+        `SELECT COUNT(*)::int AS count FROM mentor_payout_account
            WHERE pan_number IS NOT NULL
              AND pan_verified = FALSE
              AND pan_rejection_reason IS NULL`,
-        ),
-        db.query(
-          `SELECT COUNT(*)::int AS count FROM payout WHERE status = 'pending'`,
-        ),
-        db.query(
-          `SELECT COUNT(*)::int AS count, COALESCE(SUM(gross_amount), 0) AS total
+      ),
+      db.query(
+        `SELECT COUNT(*)::int AS count FROM mentor_payout_account
+           WHERE account_number IS NOT NULL
+             AND bank_verified = FALSE
+             AND bank_rejection_reason IS NOT NULL`,
+      ),
+      db.query(
+        `SELECT COUNT(*)::int AS count FROM mentor_payout_account
+           WHERE pan_number IS NOT NULL
+             AND pan_verified = FALSE
+             AND pan_rejection_reason IS NOT NULL`,
+      ),
+      db.query(
+        `SELECT COUNT(*)::int AS count FROM payout WHERE status = 'pending'`,
+      ),
+      db.query(
+        `SELECT COUNT(*)::int AS count, COALESCE(SUM(gross_amount), 0) AS total
            FROM payout
            WHERE status = 'completed' AND completed_at >= $1`,
-          [monthStartUTC],
-        ),
-        db.query(
-          `SELECT COUNT(*)::int AS count
+        [monthStartUTC],
+      ),
+      db.query(
+        `SELECT COUNT(*)::int AS count
            FROM payout
            WHERE status = 'failed' AND failed_at >= $1`,
-          [monthStartUTC],
-        ),
-        db.query(
-          `SELECT created_at, metadata
+        [monthStartUTC],
+      ),
+      db.query(
+        `SELECT created_at, metadata
            FROM admin_action_log
            WHERE action = 'payouts_generated'
            ORDER BY created_at DESC LIMIT 1`,
-        ),
-      ]);
+      ),
+    ]);
 
     let last_generation = null;
     if (lastGen.rows.length > 0) {
@@ -1460,6 +1490,10 @@ const handlers = {
           bank: bankCount.rows[0].count,
           pan: panCount.rows[0].count,
         },
+        action_required: {
+          bank: bankActionRequired.rows[0].count,
+          pan: panActionRequired.rows[0].count,
+        },
         pending_payouts: pendingPayouts.rows[0].count,
         completed_this_month: {
           count: completed.rows[0].count,
@@ -1472,7 +1506,7 @@ const handlers = {
   },
 
   // ──────────────────────────────────────────────────────────
-  // GET /admin/payouts/verifications/pending?type=bank|pan
+  // GET /admin/payouts/verifications/pending?type=bank|pan&state=pending_review|action_required
   // ──────────────────────────────────────────────────────────
   payoutsVerificationsPending: async (queryParams) => {
     const db = await getPool();
@@ -1483,13 +1517,24 @@ const handlers = {
         body: { error: "type must be 'bank' or 'pan'" },
       };
     }
+    const state = queryParams.state || "pending_review";
+    if (state !== "pending_review" && state !== "action_required") {
+      return {
+        statusCode: 400,
+        body: {
+          error: "state must be 'pending_review' or 'action_required'",
+        },
+      };
+    }
     const limit = Math.min(parseInt(queryParams.limit || "20"), 50);
     const offset = parseInt(queryParams.offset || "0");
 
     const isBank = type === "bank";
+    const rejectionPredicate =
+      state === "action_required" ? "IS NOT NULL" : "IS NULL";
     const filter = isBank
-      ? "mpa.account_number IS NOT NULL AND mpa.bank_verified = FALSE AND mpa.bank_rejection_reason IS NULL"
-      : "mpa.pan_number IS NOT NULL AND mpa.pan_verified = FALSE AND mpa.pan_rejection_reason IS NULL";
+      ? `mpa.account_number IS NOT NULL AND mpa.bank_verified = FALSE AND mpa.bank_rejection_reason ${rejectionPredicate}`
+      : `mpa.pan_number IS NOT NULL AND mpa.pan_verified = FALSE AND mpa.pan_rejection_reason ${rejectionPredicate}`;
     const orderCol = isBank ? "mpa.bank_submitted_at" : "mpa.pan_submitted_at";
 
     const totalQ = await db.query(
@@ -1511,9 +1556,11 @@ const handlers = {
          mpa.ifsc_code,
          mpa.bank_name,
          mpa.bank_verified,
+         mpa.bank_rejection_reason,
          mpa.pan_number,
          mpa.pan_document_url AS pan_key,
-         mpa.pan_verified
+         mpa.pan_verified,
+         mpa.pan_rejection_reason
        FROM mentor_payout_account mpa
        JOIN "user" u ON u.id = mpa.user_id
        LEFT JOIN mentor_profile mp ON mp.user_id = u.id
@@ -1526,6 +1573,17 @@ const handlers = {
 
     const items = await Promise.all(
       result.rows.map(async (r) => {
+        const fieldStatus = isBank
+          ? derivePayoutFieldStatus(
+              r.account_number,
+              r.bank_verified,
+              r.bank_rejection_reason,
+            )
+          : derivePayoutFieldStatus(
+              r.pan_number,
+              r.pan_verified,
+              r.pan_rejection_reason,
+            );
         const item = {
           user_id: r.user_id,
           mentor_name: r.mentor_name,
@@ -1533,6 +1591,10 @@ const handlers = {
           aadhaar_verified: r.aadhaar_verified || false,
           selfie_url: await presignS3(r.selfie_key, 3600),
           submitted_at: isBank ? r.bank_submitted_at : r.pan_submitted_at,
+          state: fieldStatus,
+          rejection_reason: isBank
+            ? r.bank_rejection_reason || null
+            : r.pan_rejection_reason || null,
           bank: null,
           pan: null,
           cross_reference: {
