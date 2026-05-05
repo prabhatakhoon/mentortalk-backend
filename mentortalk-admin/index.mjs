@@ -2527,10 +2527,15 @@ const handlers = {
         period_end: period_end.toISOString(),
       };
 
+      // Bulk job has no single target user. Use platform sentinel so the
+      // NOT NULL constraint on admin_action_log.target_user_id is satisfied.
+      // Filter these out later with `target_user_id = PLATFORM_USER_ID` once
+      // we have more batch jobs and want a dedicated payout_generation_run table.
+      const PLATFORM_USER_ID = "00000000-0000-0000-0000-000000000000";
       await client.query(
         `INSERT INTO admin_action_log (admin_id, target_user_id, action, metadata)
-         VALUES ($1, NULL, 'payouts_generated', $2)`,
-        [reviewer_id, JSON.stringify(meta)],
+         VALUES ($1, $2, 'payouts_generated', $3)`,
+        [reviewer_id, PLATFORM_USER_ID, JSON.stringify(meta)],
       );
 
       await client.query("COMMIT");
