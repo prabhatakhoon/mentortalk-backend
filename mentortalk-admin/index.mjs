@@ -2100,6 +2100,22 @@ const handlers = {
         ],
       );
 
+      // Platform-side credit (double-entry): cash leaves platform_cash to settle the mentor liability.
+      await client.query(
+        `INSERT INTO transaction (user_id, type, direction, amount, reference_id, status, notes)
+         VALUES (
+           '00000000-0000-0000-0000-000000000000',
+           'platform_payout',
+           'credit',
+           $1,
+           $2,
+           'completed',
+           $3
+         )`,
+        [payout.gross_amount, payoutId, txnNotes],
+      );
+      // TODO: when TDS activates, also insert tds_deduction (mentor debit) + tds_payable (platform credit)
+
       const walletRes = await client.query(
         `UPDATE wallet
          SET balance = balance - $2, updated_at = NOW()
