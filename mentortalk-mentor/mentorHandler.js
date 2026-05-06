@@ -166,6 +166,35 @@ function derivePayoutFieldStatus(rowExists, fieldValue, verified, rejectionReaso
   return "pending_review";
 }
 
+// Next scheduled payout fire = next 7th of the month at 10:00 IST (= 04:30 UTC).
+function nextScheduledPayoutDate() {
+  const now = new Date();
+  const ist = new Date(now.getTime() + 5.5 * 60 * 60 * 1000);
+  const year = ist.getUTCFullYear();
+  const month = ist.getUTCMonth();
+
+  const this7thIST = new Date(Date.UTC(year, month, 7, 10, 0, 0));
+  const next7thIST = new Date(Date.UTC(year, month + 1, 7, 10, 0, 0));
+
+  const useDate = ist.getTime() < this7thIST.getTime() ? this7thIST : next7thIST;
+  return new Date(useDate.getTime() - 5.5 * 60 * 60 * 1000);
+}
+
+// Previous calendar month range, computed in IST and returned as UTC Dates.
+// Mirrors getPreviousMonthRangeIST in mentortalk-admin/index.mjs — keep in sync.
+function getPreviousMonthRangeIST(asOfDate) {
+  const istOffsetMs = 5.5 * 60 * 60 * 1000;
+  const ist = new Date(asOfDate.getTime() + istOffsetMs);
+  const year = ist.getUTCFullYear();
+  const month = ist.getUTCMonth();
+  const startIST = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0));
+  const endIST = new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
+  return {
+    period_start: new Date(startIST.getTime() - istOffsetMs),
+    period_end: new Date(endIST.getTime() - istOffsetMs),
+  };
+}
+
 // ─── Route Handler ───────────────────────────────────────────
 
 export const handler = async (event) => {
@@ -2007,41 +2036,95 @@ async function deleteQuickReply(userId, event) {
 async function getPayoutsSummary(userId) {
   const db = await getPool();
   const result = await db.query(
-    `SELECT account_number, ifsc_code, bank_verified, bank_rejection_reason,
-            pan_number, pan_verified, pan_rejection_reason
-     FROM mentor_payout_account WHERE user_id = $1`,
+    `SELECT
+       u.account_status,
+       w.balance AS wallet_balance,
+       (mpa.user_id IS NOT NULL) AS mpa_exists,
+       mpa.account_number, mpa.ifsc_code,
+       mpa.bank_verified, mpa.bank_verified_at, mpa.bank_rejection_reason,
+       mpa.pan_number, mpa.pan_verified, mpa.pan_rejection_reason
+     FROM "user" u
+     LEFT JOIN wallet w ON w.user_id = u.id AND w.type = 'mentor'
+     LEFT JOIN mentor_payout_account mpa ON mpa.user_id = u.id
+     WHERE u.id = $1`,
     [userId]
   );
 
-  const row = result.rows[0];
-  const rowExists = !!row;
+  const row = result.rows[0] || {};
+  const rowExists = row.mpa_exists === true;
 
   const bankStatus = derivePayoutFieldStatus(
     rowExists,
-    row?.account_number,
-    row?.bank_verified,
-    row?.bank_rejection_reason
+    row.account_number,
+    row.bank_verified,
+    row.bank_rejection_reason
   );
   const panStatus = derivePayoutFieldStatus(
     rowExists,
-    row?.pan_number,
-    row?.pan_verified,
-    row?.pan_rejection_reason
+    row.pan_number,
+    row.pan_verified,
+    row.pan_rejection_reason
   );
 
-  return respond(200, {
+  const response = {
     bank: {
       status: bankStatus,
-      ifsc: row?.ifsc_code || null,
-      account_last4: row?.account_number ? row.account_number.slice(-4) : null,
-      rejection_reason: row?.bank_rejection_reason || null,
+      ifsc: row.ifsc_code || null,
+      account_last4: row.account_number ? row.account_number.slice(-4) : null,
+      rejection_reason: row.bank_rejection_reason || null,
     },
     pan: {
       status: panStatus,
-      pan_masked: row?.pan_number ? maskPan(row.pan_number) : null,
-      rejection_reason: row?.pan_rejection_reason || null,
+      pan_masked: row.pan_number ? maskPan(row.pan_number) : null,
+      rejection_reason: row.pan_rejection_reason || null,
     },
-  });
+  };
+
+  // Suspended users: omit next_payout entirely. Frontend treats missing field
+  // as "don't render the card."
+  if (row.account_status === "active") {
+    const minThresholdPaisa = 50000;
+    const minThresholdInr = minThresholdPaisa / 100;
+    const balanceInr = parseFloat(row.wallet_balance ?? 0);
+    const balancePaisa = Math.round(balanceInr * 100);
+
+    const bankVerified = row.bank_verified === true;
+    const panVerified = row.pan_verified === true;
+    const bankVerifiedAt = row.bank_verified_at
+      ? new Date(row.bank_verified_at)
+      : null;
+    const cooldownEndMs = bankVerifiedAt
+      ? bankVerifiedAt.getTime() + 48 * 60 * 60 * 1000
+      : null;
+    const cooldownActive =
+      bankVerified && cooldownEndMs !== null && cooldownEndMs > Date.now();
+
+    const blockers = [];
+    if (!bankVerified) blockers.push("bank_unverified");
+    if (!panVerified) blockers.push("pan_unverified");
+    if (balanceInr < minThresholdInr) blockers.push("below_threshold");
+    if (cooldownActive) blockers.push("cooldown_active");
+
+    const scheduled = nextScheduledPayoutDate();
+    const { period_start, period_end } = getPreviousMonthRangeIST(scheduled);
+
+    response.next_payout = {
+      amount_paisa: balancePaisa,
+      scheduled_date: scheduled.toISOString(),
+      covers_period: {
+        start: period_start.toISOString(),
+        end: period_end.toISOString(),
+      },
+      eligible: blockers.length === 0,
+      blockers,
+      min_threshold_paisa: minThresholdPaisa,
+      cooldown_clears_at: cooldownActive
+        ? new Date(cooldownEndMs).toISOString()
+        : null,
+    };
+  }
+
+  return respond(200, response);
 }
 
 // ─── GET /mentor/payouts/bank ────────────────────────────────
