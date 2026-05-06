@@ -330,88 +330,209 @@ async function handleGetMessages(userId, event) {
   const requesterIsMentor = session.mentor_id === userId;
   const isActiveSession = session.status === "active";
 
-  // For mentors viewing a past session, gate media presigning on the mentee's
-  // download-access flag. Mentees always see their own media.
+  // For mentors viewing a past session, gate media presigning AND reply
+  // snapshots on the mentee's chat-access flags. Mentees always see their
+  // own media + snapshots.
   let menteePrivacy = null;
   if (requesterIsMentor && !isActiveSession) {
     const { rows } = await db.query(
-      `SELECT mentor_download_access
+      `SELECT mentor_chat_access, mentor_download_access
          FROM mentee_privacy_settings WHERE user_id = $1`,
       [session.mentee_id]
     );
-    menteePrivacy = rows[0] || { mentor_download_access: false };
+    menteePrivacy = rows[0] || { mentor_chat_access: false, mentor_download_access: false };
   }
 
   // Parse query params
   const params = event.queryStringParameters || {};
   const limit = Math.min(parseInt(params.limit) || 50, 100);
   const lastKey = params.last_key ? JSON.parse(decodeURIComponent(params.last_key)) : undefined;
-  const order = params.order === "asc" ? "asc" : "desc"; // default newest first
+  const order = params.order === "asc" ? "asc" : "desc";
+  const aroundId = params.around || null;
+  const afterId = params.after || null;
 
-  // Query DynamoDB
+  // ── Around mode: single round-trip window centered on a target message ──
+  if (aroundId) {
+    return await handleAroundMessages({
+      sessionId, aroundId, limit,
+      requesterIsMentor, isActiveSession, menteePrivacy,
+    });
+  }
+
+  // ── After mode: forward pagination from a target (oldest-first) ──
+  if (afterId) {
+    const queryParams = {
+      TableName: "mentortalk-messages",
+      KeyConditionExpression: "session_id = :sid AND message_id > :after",
+      ExpressionAttributeValues: { ":sid": sessionId, ":after": afterId },
+      ScanIndexForward: true,
+      Limit: limit,
+    };
+    const result = await dynamoClient.send(new QueryCommand(queryParams));
+    const messages = await Promise.all((result.Items || []).map((item) =>
+      formatMessage(item, { requesterIsMentor, isActiveSession, menteePrivacy })
+    ));
+    const response = { messages, count: messages.length };
+    if (result.LastEvaluatedKey) {
+      response.last_key_newer = encodeURIComponent(JSON.stringify(result.LastEvaluatedKey));
+    }
+    response.has_newer = result.Items && result.Items.length === limit;
+    return respond(200, response);
+  }
+
+  // ── Default: backwards-paginated history (newest-first or oldest-first) ──
   const queryParams = {
     TableName: "mentortalk-messages",
     KeyConditionExpression: "session_id = :sid",
     ExpressionAttributeValues: { ":sid": sessionId },
-    ScanIndexForward: order === "asc", // true = oldest first, false = newest first
+    ScanIndexForward: order === "asc",
     Limit: limit,
   };
-
-  if (lastKey) {
-    queryParams.ExclusiveStartKey = lastKey;
-  }
+  if (lastKey) queryParams.ExclusiveStartKey = lastKey;
 
   const result = await dynamoClient.send(new QueryCommand(queryParams));
+  const messages = await Promise.all((result.Items || []).map((item) =>
+    formatMessage(item, { requesterIsMentor, isActiveSession, menteePrivacy })
+  ));
 
-  const messages = await Promise.all((result.Items || [])).map(async (item) => {
-    const msg = {
-      message_id: item.message_id,
-      session_id: item.session_id,
-      sender_id: item.sender_id,
-      content: item.content,
-      type: item.type || "text",
-      created_at: item.created_at,
-      client_message_id: item.client_message_id || null,
-      system_event: item.system_event || null,
-      metadata: item.metadata || null,
-    };
-
-    if (item.media_url) {
-      const allowDownload =
-        !requesterIsMentor || isActiveSession || menteePrivacy?.mentor_download_access;
-      if (allowDownload) {
-        msg.media_url = await getSignedUrl(s3Client, new GetObjectCommand({
-          Bucket: BUCKET_NAME,
-          Key: item.media_url,
-        }), { expiresIn: 3600 });
-      } else {
-        msg.media_url = null;
-      }
-    }
-    if (item.media_metadata) {
-      try {
-        msg.media_metadata = typeof item.media_metadata === 'string'
-          ? JSON.parse(item.media_metadata)
-          : item.media_metadata;
-      } catch {
-        msg.media_metadata = item.media_metadata;
-      }
-    }
-
-    return msg;
-  });
-
-  const response = {
-    messages,
-    count: messages.length,
-  };
-
-  // Pagination cursor
+  const response = { messages, count: messages.length };
   if (result.LastEvaluatedKey) {
     response.last_key = encodeURIComponent(JSON.stringify(result.LastEvaluatedKey));
   }
-
   return respond(200, response);
+}
+
+// ─── Around mode: parallel older-half + newer-half queries ───
+//
+// Discord/Telegram-style centered window. Returns up to ~2N+1 messages in
+// chronological order, plus cursors for further pagination in either
+// direction. One round-trip (two parallel DynamoDB queries) instead of
+// sequential paginate-until-found.
+async function handleAroundMessages({
+  sessionId, aroundId, limit,
+  requesterIsMentor, isActiveSession, menteePrivacy,
+}) {
+  const half = Math.max(5, Math.floor(limit / 2));
+
+  const [olderResult, newerResult] = await Promise.all([
+    dynamoClient.send(new QueryCommand({
+      TableName: "mentortalk-messages",
+      KeyConditionExpression: "session_id = :sid AND message_id <= :target",
+      ExpressionAttributeValues: { ":sid": sessionId, ":target": aroundId },
+      ScanIndexForward: false, // newest-first within the older half
+      Limit: half + 1,         // +1 because target itself is included
+    })),
+    dynamoClient.send(new QueryCommand({
+      TableName: "mentortalk-messages",
+      KeyConditionExpression: "session_id = :sid AND message_id > :target",
+      ExpressionAttributeValues: { ":sid": sessionId, ":target": aroundId },
+      ScanIndexForward: true,
+      Limit: half,
+    })),
+  ]);
+
+  // Target must appear at the head of the older half (since SK ordering
+  // matches chronology). If it doesn't, the message id is bogus or deleted.
+  const olderItems = olderResult.Items || [];
+  if (olderItems.length === 0 || olderItems[0].message_id !== aroundId) {
+    return respond(404, { error: "Message not found" });
+  }
+
+  const newerItems = newerResult.Items || [];
+  // Reverse older to oldest→newest, then append newer (already oldest→newest).
+  const merged = [...olderItems.slice().reverse(), ...newerItems];
+
+  const messages = await Promise.all(merged.map((item) =>
+    formatMessage(item, { requesterIsMentor, isActiveSession, menteePrivacy })
+  ));
+
+  const response = { messages, count: messages.length, around: aroundId };
+  if (olderResult.LastEvaluatedKey) {
+    response.last_key_older = encodeURIComponent(JSON.stringify(olderResult.LastEvaluatedKey));
+  }
+  if (newerResult.LastEvaluatedKey) {
+    response.last_key_newer = encodeURIComponent(JSON.stringify(newerResult.LastEvaluatedKey));
+  }
+  response.has_newer = newerItems.length === half;
+  return respond(200, response);
+}
+
+// ─── Format a single DynamoDB message item for the response ───
+//
+// Applies media presigning, reply snapshot pass-through, and the mentor
+// past-session privacy gate (mentor_chat_access blanks the snapshot;
+// mentor_download_access blanks media_url). Mentees and active-session
+// participants see everything.
+async function formatMessage(item, { requesterIsMentor, isActiveSession, menteePrivacy }) {
+  const msg = {
+    message_id: item.message_id,
+    session_id: item.session_id,
+    sender_id: item.sender_id,
+    content: item.content,
+    type: item.type || "text",
+    created_at: item.created_at,
+    client_message_id: item.client_message_id || null,
+    system_event: item.system_event || null,
+    metadata: item.metadata || null,
+  };
+
+  if (item.media_url) {
+    const allowDownload =
+      !requesterIsMentor || isActiveSession || menteePrivacy?.mentor_download_access;
+    if (allowDownload) {
+      msg.media_url = await getSignedUrl(s3Client, new GetObjectCommand({
+        Bucket: BUCKET_NAME,
+        Key: item.media_url,
+      }), { expiresIn: 3600 });
+    } else {
+      msg.media_url = null;
+    }
+  }
+  if (item.media_metadata) {
+    try {
+      msg.media_metadata = typeof item.media_metadata === 'string'
+        ? JSON.parse(item.media_metadata)
+        : item.media_metadata;
+    } catch {
+      msg.media_metadata = item.media_metadata;
+    }
+  }
+
+  if (item.reply_to_message_id) {
+    msg.reply_to_message_id = item.reply_to_message_id;
+
+    // Privacy gate: hide snapshot when mentor lacks chat access on a past
+    // session. The reply still renders, but the quoted strip shows
+    // "Original message hidden" rather than the preview.
+    const allowSnapshot =
+      !requesterIsMentor || isActiveSession || menteePrivacy?.mentor_chat_access;
+    if (allowSnapshot && item.reply_to_snapshot) {
+      try {
+        const snap = typeof item.reply_to_snapshot === 'string'
+          ? JSON.parse(item.reply_to_snapshot)
+          : item.reply_to_snapshot;
+        // Resolve image thumb (S3 key) to presigned URL when present and
+        // download is allowed.
+        if (snap?.media_thumb) {
+          const allowDownload =
+            !requesterIsMentor || isActiveSession || menteePrivacy?.mentor_download_access;
+          snap.media_thumb = allowDownload
+            ? await getSignedUrl(s3Client, new GetObjectCommand({
+                Bucket: BUCKET_NAME,
+                Key: snap.media_thumb,
+              }), { expiresIn: 3600 })
+            : null;
+        }
+        msg.reply_to_snapshot = snap;
+      } catch {
+        msg.reply_to_snapshot = { hidden: true };
+      }
+    } else {
+      msg.reply_to_snapshot = { hidden: true };
+    }
+  }
+
+  return msg;
 }
 
 // ─── POST /session/request ───────────────────────────────────
