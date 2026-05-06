@@ -131,7 +131,7 @@ exports.handler = async (event) => {
  * }
  */
 async function handleSendMessage(apiClient, sender, body) {
-  const { session_id, recipient_id, content, type, client_message_id, media_url, media_metadata } = body;
+  const { session_id, recipient_id, content, type, client_message_id, media_url, media_metadata, reply_to_message_id } = body;
 
   const msgType = type || 'text';
   const isMediaMessage = ['audio', 'image', 'file'].includes(msgType);
@@ -163,6 +163,36 @@ async function handleSendMessage(apiClient, sender, body) {
       message: 'media_url is required for media messages.',
     });
     return ok();
+  }
+
+  // ── Reply-to: load parent, validate, build snapshot server-side ──
+  // Parent must be in the same session, must not be a system message, and
+  // its content must be the *masked* version (never original_content) to
+  // avoid leaking flagged contact info via the snapshot.
+  let replyToSnapshot = null;
+  if (reply_to_message_id) {
+    const parentResult = await docClient.send(new GetCommand({
+      TableName: TABLES.messages,
+      Key: { session_id, message_id: reply_to_message_id },
+    }));
+    const parent = parentResult.Item;
+    if (!parent) {
+      await postToConnection(apiClient, sender.connection_id, {
+        type: 'error',
+        code: 'INVALID_REPLY_TARGET',
+        message: 'Cannot reply: target message not found in this session.',
+      });
+      return ok();
+    }
+    if (parent.sender_id === 'system' || parent.type === 'system') {
+      await postToConnection(apiClient, sender.connection_id, {
+        type: 'error',
+        code: 'INVALID_REPLY_TARGET',
+        message: 'Cannot reply to system messages.',
+      });
+      return ok();
+    }
+    replyToSnapshot = buildReplySnapshot(parent);
   }
 
  // Generate server message ID (ULID-like: timestamp + random for sortability)
@@ -222,6 +252,11 @@ async function handleSendMessage(apiClient, sender, body) {
     messageItem.detected_pattern = detected;
   }
 
+  if (reply_to_message_id) {
+    messageItem.reply_to_message_id = reply_to_message_id;
+    messageItem.reply_to_snapshot = JSON.stringify(replyToSnapshot);
+  }
+
   await docClient.send(new PutCommand({
     TableName: TABLES.messages,
     Item: messageItem,
@@ -265,6 +300,11 @@ async function handleSendMessage(apiClient, sender, body) {
             ? media_metadata
             : JSON.parse(media_metadata);
         }
+      }
+
+      if (reply_to_message_id) {
+        forwardPayload.reply_to_message_id = reply_to_message_id;
+        forwardPayload.reply_to_snapshot = replyToSnapshot;
       }
 
       await postToConnection(apiClient, recipientConn.connection_id, forwardPayload);
@@ -495,6 +535,50 @@ async function cleanupStaleConnection(userId) {
       last_seen: new Date().toISOString(),
     },
   }));
+}
+
+/**
+ * Build a reply snapshot for the quoted-strip preview, server-side.
+ *
+ * Stored on the reply (not looked up at render time) so the quoted strip
+ * draws without an extra fetch and survives parent edits/deletes.
+ *
+ * Uses parent.content (already masked if flagged) — never original_content,
+ * which would leak detected contact info via the snapshot.
+ */
+function buildReplySnapshot(parent) {
+  const type = parent.type || 'text';
+  let preview = '';
+  let mediaThumb = null;
+
+  if (type === 'text') {
+    preview = (parent.content || '').slice(0, 120);
+  } else if (type === 'image') {
+    preview = 'Photo';
+    mediaThumb = parent.media_url || null; // S3 key — recipient resolves to presigned at render
+  } else if (type === 'audio') {
+    preview = 'Voice message';
+  } else if (type === 'file') {
+    let metaName = null;
+    if (parent.media_metadata) {
+      try {
+        const meta = typeof parent.media_metadata === 'string'
+          ? JSON.parse(parent.media_metadata)
+          : parent.media_metadata;
+        metaName = meta?.file_name || null;
+      } catch (_) { /* ignore */ }
+    }
+    preview = metaName || 'File';
+  } else {
+    preview = '';
+  }
+
+  return {
+    sender_id: parent.sender_id,
+    type,
+    preview,
+    media_thumb: mediaThumb,
+  };
 }
 
 /**
