@@ -55,6 +55,10 @@ const dynamoClient = DynamoDBDocumentClient.from(
 
 let jwtSecret = null;
 
+// Video sessions are billed at this multiple of the mentor's base chat rate.
+// Mirror in mentortalk-mentor/mentorHandler.js and mentortalk-session/sessionHandler.js.
+const VIDEO_RATE_MULTIPLIER = 1.5;
+
 const getJwtSecret = async () => {
   if (jwtSecret) return jwtSecret;
   const response = await secretsClient.send(
@@ -189,6 +193,9 @@ async function formatMentorRow(row) {
         rating: parseFloat(Number(row.avg_rating).toFixed(1)),
         total_sessions: parseInt(row.total_sessions),
         rate_per_minute: parseInt(row.rate_per_minute),
+        video_rate_per_minute: row.rate_per_minute != null
+          ? parseFloat(row.rate_per_minute) * VIDEO_RATE_MULTIPLIER
+          : null,
         is_available: row.is_available ?? false,
         intro_rate_eligible: row.intro_rate_eligible ?? false,
       };
@@ -871,6 +878,9 @@ async function getMentorProfile(db, userId, queryParams, menteeIntroEligible = f
     gender: row.gender || null,
     bio: row.bio || null,
     rate_per_minute: parseInt(row.rate_per_minute) || 0,
+    video_rate_per_minute: row.rate_per_minute != null
+      ? parseFloat(row.rate_per_minute) * VIDEO_RATE_MULTIPLIER
+      : null,
     is_available: row.is_available ?? false,
     intro_rate_eligible: menteeIntroEligible && row.intro_discount_percent != null,
     intro_discount_percent: row.intro_discount_percent,
