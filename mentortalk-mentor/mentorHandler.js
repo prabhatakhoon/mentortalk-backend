@@ -2107,8 +2107,16 @@ async function getPayoutsSummary(userId) {
       bankVerified && cooldownEndMs !== null && cooldownEndMs > Date.now();
 
     const blockers = [];
-    if (!bankVerified) blockers.push("bank_unverified");
-    if (!panVerified) blockers.push("pan_unverified");
+    if (bankStatus === "not_submitted" || bankStatus === "action_required") {
+      blockers.push("bank_unverified");
+    } else if (bankStatus === "pending_review") {
+      blockers.push("bank_pending_review");
+    }
+    if (panStatus === "not_submitted" || panStatus === "action_required") {
+      blockers.push("pan_unverified");
+    } else if (panStatus === "pending_review") {
+      blockers.push("pan_pending_review");
+    }
     if (balanceInr < minThresholdInr) blockers.push("below_threshold");
     if (cooldownActive) blockers.push("cooldown_active");
 
