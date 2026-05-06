@@ -2472,6 +2472,7 @@ async function getPayoutsList(userId, event) {
       bank_account_last4: last4,
       bank_name: r.bank_name,
       utr: r.utr,
+      created_at: r.created_at,
       initiated_at: r.initiated_at,
       completed_at: r.completed_at,
       failure_reason: r.failure_reason,
