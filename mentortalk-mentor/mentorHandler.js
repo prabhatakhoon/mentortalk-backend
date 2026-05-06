@@ -24,6 +24,10 @@ function toFullUrl(path) {
 let pool = null;
 let jwtSecret = null;
 
+// Video sessions are billed at this multiple of the mentor's base chat rate.
+// Mirror in mentortalk-mentee-discover and mentortalk-session/sessionHandler.js.
+const VIDEO_RATE_MULTIPLIER = 1.5;
+
 // ─── Shared Setup ────────────────────────────────────────────
 
 const getDbCredentials = async () => {
@@ -389,6 +393,9 @@ LEFT JOIN user_language ul ON ul.user_id = u.id AND ul.role = 'mentor'
     profile_image_url: toFullUrl(row.profile_photo_url),
     bio: row.bio,
     rate_per_minute: row.rate_per_minute ? parseFloat(row.rate_per_minute) : null,
+    video_rate_per_minute: row.rate_per_minute
+      ? parseFloat(row.rate_per_minute) * VIDEO_RATE_MULTIPLIER
+      : null,
     intro_discount_percent: row.intro_discount_percent,
     intro_rate_per_minute: row.intro_discount_percent != null
       ? parseFloat(row.rate_per_minute) * (1 - row.intro_discount_percent / 100)
