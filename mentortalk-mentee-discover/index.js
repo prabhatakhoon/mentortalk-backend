@@ -389,6 +389,7 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
        WHERE u.role = 'mentor'
          AND u.account_status = 'active'
          AND u.phone_number != '+910000000000'
+         AND EXISTS (SELECT 1 FROM mentorship_application ma WHERE ma.user_id = mp2.user_id AND ma.submission_status = 'approved')
          ${catIds ? `AND EXISTS (SELECT 1 FROM user_mentorship um WHERE um.user_id = mp2.user_id AND um.role = 'mentor' AND um.mentorship_category_id IN (SELECT cat_id FROM mentee_cats))` : ''}
          ${blockedCondition}
      ),
@@ -529,6 +530,7 @@ async function searchMentors(db, queryParams, blockedIds = [], menteeIntroEligib
     `u.role = 'mentor'`,
     `u.account_status = 'active'`,
     `u.phone_number != '+910000000000'`,
+    `EXISTS (SELECT 1 FROM mentorship_application ma WHERE ma.user_id = u.id AND ma.submission_status = 'approved')`,
   ];
   const joins = [`JOIN mentor_profile mp ON mp.user_id = u.id`];
   const params = [];
