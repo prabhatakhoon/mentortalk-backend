@@ -664,6 +664,23 @@ const handlers = {
       role,
     ]);
 
+    // If this leaves the mentor with zero education entries, roll step2_status
+    // back so the checklist no longer shows "done" with empty education.
+    if (role === 'mentor') {
+      const remaining = await db.query(
+        `SELECT COUNT(*)::int AS count FROM education WHERE user_id = $1 AND role = 'mentor'`,
+        [userId]
+      );
+      if (remaining.rows[0].count === 0) {
+        await db.query(
+          `UPDATE mentorship_application
+           SET step2_status = 'in_progress', updated_at = NOW()
+           WHERE user_id = $1 AND step2_status = 'done'`,
+          [userId]
+        );
+      }
+    }
+
     return { statusCode: 200, body: { message: "Education deleted" } };
   },
 
