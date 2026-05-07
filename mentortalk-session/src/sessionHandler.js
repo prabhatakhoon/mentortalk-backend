@@ -3045,6 +3045,7 @@ async function handleGetActiveSession(userId, event) {
     other_user_avatar: otherUserAvatar,
     started_at: s.started_at?.toISOString() || null,
     max_duration_seconds: maxDurationSeconds,
+    min_duration_secs: parseInt(process.env.MIN_SESSION_DURATION_SECS ?? '60', 10),
     timeout_seconds: timeoutSeconds,
     queue_position: queuePosition,
     call_type: callType,
