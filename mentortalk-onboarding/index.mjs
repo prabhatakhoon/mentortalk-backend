@@ -1056,7 +1056,8 @@ export const handler = async (event) => {
 
     if (
       error.name === "JsonWebTokenError" ||
-      error.name === "TokenExpiredError"
+      error.name === "TokenExpiredError" ||
+      error.message?.includes("authorization header")
     ) {
       return respond({ statusCode: 401, body: { error: "Invalid or expired token" } });
     }
