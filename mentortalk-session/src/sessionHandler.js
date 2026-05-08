@@ -561,7 +561,7 @@ async function handleSessionRequest(menteeId, event) {
     `SELECT u.id, mp.first_name, mp.last_name,
             mp.rate_per_minute, mp.profile_photo_url,
             mp.is_available, mp.pref_audio, mp.pref_video,
-            mp.intro_discount_percent
+            mp.chat_discount_percent, mp.intro_promo_enabled
      FROM "user" u
      JOIN mentor_profile mp ON mp.user_id = u.id
      JOIN mentorship_application ma ON ma.user_id = u.id
@@ -594,24 +594,30 @@ async function handleSessionRequest(menteeId, event) {
   const baseRate = parseFloat(mentor.rate_per_minute);
   let ratePerMinute = session_type === "video" ? baseRate * 1.5 : baseRate;
 
-  // 2b. Check intro rate eligibility
+  // 2a. Apply mentor's universal chat discount (chat sessions only).
+  // This is the rate the mentee pays when not eligible for the platform promo.
+  if (session_type === 'chat' && mentor.chat_discount_percent != null) {
+    ratePerMinute = baseRate * (1 - mentor.chat_discount_percent / 100);
+  }
+
+  // 2b. Platform first-session promo eligibility (overrides chat discount when eligible).
   let billingType = 'paid';
   let introRatePerMinute = null;
 
-  if (session_type === 'chat') {
+  if (session_type === 'chat' && mentor.intro_promo_enabled) {
     const promoResult = await db.query(
-      `SELECT intro_session_used FROM mentee_promo_status WHERE user_id = $1`,
+      `SELECT intro_session_id FROM mentee_promo_status WHERE user_id = $1`,
       [menteeId]
     );
 
-    if (promoResult.rows.length > 0 && !promoResult.rows[0].intro_session_used && mentor.intro_discount_percent != null) {
+    if (promoResult.rows.length > 0 && promoResult.rows[0].intro_session_id == null) {
       const cfgResult = await db.query(
-        `SELECT intro_rate_enabled FROM promo_config WHERE id = 1`
+        `SELECT intro_rate_enabled, intro_rate_per_minute FROM promo_config WHERE id = 1`
       );
       const cfg = cfgResult.rows[0];
       if (cfg?.intro_rate_enabled) {
         billingType = 'intro_rate';
-        introRatePerMinute = baseRate * (1 - mentor.intro_discount_percent / 100);
+        introRatePerMinute = parseFloat(cfg.intro_rate_per_minute);
       }
     }
   }
@@ -799,6 +805,8 @@ async function handleSessionAccept(userId, event) {
   const sessionType = session.requested_session_type || "chat";
   const baseRate = parseFloat(session.rate_per_minute);
   const ratePerMinute = sessionType === "video" ? baseRate * 1.5 : baseRate;
+  // chat_discount_percent is read alongside the rate inside the rate-calc block below
+  // (snapshotted into session_segment so mid-session changes can't affect billing).
   // Cancel request timeout schedule
   await deleteRequestTimeoutSchedule(session.request_timeout_schedule);
 
@@ -812,17 +820,25 @@ async function handleSessionAccept(userId, event) {
       [sessionId]
     );
 
-    // Determine rate based on billing_type
+    // Determine rate based on billing_type. Snapshot at accept-time so any
+    // change to mentor_profile or promo_config after this point doesn't affect billing.
     let effectiveRate = ratePerMinute;
     if (session.billing_type === 'free_intro') {
       effectiveRate = 0;
     } else if (session.billing_type === 'intro_rate') {
-      const mentorDiscount = (await client.query(
-        `SELECT intro_discount_percent FROM mentor_profile WHERE user_id = $1`,
+      // Platform first-session promo: flat rate from promo_config.
+      const cfgRow = (await client.query(
+        `SELECT intro_rate_per_minute FROM promo_config WHERE id = 1`
+      )).rows[0];
+      effectiveRate = parseFloat(cfgRow?.intro_rate_per_minute) || 0;
+    } else if (sessionType === 'chat') {
+      // Paid chat: apply mentor's universal chat discount if set.
+      const mentorRow = (await client.query(
+        `SELECT chat_discount_percent FROM mentor_profile WHERE user_id = $1`,
         [session.mentor_id]
       )).rows[0];
-      if (mentorDiscount?.intro_discount_percent != null) {
-        effectiveRate = baseRate * (1 - mentorDiscount.intro_discount_percent / 100);
+      if (mentorRow?.chat_discount_percent != null) {
+        effectiveRate = baseRate * (1 - mentorRow.chat_discount_percent / 100);
       }
     }
 
@@ -843,10 +859,10 @@ async function handleSessionAccept(userId, event) {
         [userId, cfg?.mentor_daily_free_cap || 5]
       );
 
-      // Mark mentee promo as used
+      // Mark mentee free-chat entitlement as consumed (FK presence is the source of truth).
       await client.query(
         `UPDATE mentee_promo_status
-         SET free_chat_used = TRUE, free_chat_session_id = $2, free_chat_used_at = NOW()
+         SET free_chat_session_id = $2, free_chat_used_at = NOW()
          WHERE user_id = $1`,
         [session.mentee_id, sessionId]
       );
@@ -863,11 +879,11 @@ async function handleSessionAccept(userId, event) {
       }
     }
 
-    // Intro rate: mark promo as used
+    // Intro rate: mark mentee intro-promo entitlement as consumed (FK presence is the source of truth).
     if (session.billing_type === 'intro_rate') {
       await client.query(
         `UPDATE mentee_promo_status
-         SET intro_session_used = TRUE, intro_session_id = $2, intro_session_used_at = NOW()
+         SET intro_session_id = $2, intro_session_used_at = NOW()
          WHERE user_id = $1`,
         [session.mentee_id, sessionId]
       );
@@ -1409,13 +1425,15 @@ async function handleSessionEnd(userId, event) {
     }
 
     let platformFee, mentorEarning;
-    if (session.billing_type === 'paid' && grossAmount > 0) {
-      // Platform takes 100% of minute 1, then 50/50 from minute 2 onward.
+    if ((session.billing_type === 'paid' || session.billing_type === 'intro_rate') && grossAmount > 0) {
+      // Platform takes 100% of minute 1 (at the first segment's rate), then 50/50 from minute 2 onward.
+      // Applies to both paid and the platform first-session promo (intro_rate).
       const firstMinuteRate = parseFloat(segRows.rows[0]?.rate_per_minute) || 0;
       const remainingAmount = Math.max(0, grossAmount - firstMinuteRate);
       mentorEarning = remainingAmount * 0.5;
       platformFee = grossAmount - mentorEarning;
     } else {
+      // free_intro path — gross is 0, split is moot.
       platformFee = grossAmount * 0.50;
       mentorEarning = grossAmount - platformFee;
     }
@@ -1691,14 +1709,24 @@ async function promoteNextPendingSession(db, mentorId) {
   const menteeName = [menteeRow?.first_name, menteeRow?.last_name].filter(Boolean).join(' ') || 'Mentee';
   const menteeAvatar = toFullUrl(menteeRow?.profile_photo_url);
 
-  // Fetch rate for the push payload
+  // Fetch rate + chat discount for the push payload
   const mentorProfile = await db.query(
-    `SELECT rate_per_minute FROM mentor_profile WHERE user_id = $1`,
+    `SELECT rate_per_minute, chat_discount_percent FROM mentor_profile WHERE user_id = $1`,
     [mentorId]
   );
-  const ratePerMinute = parseFloat(mentorProfile.rows[0]?.rate_per_minute) || 0;
+  const baseRate = parseFloat(mentorProfile.rows[0]?.rate_per_minute) || 0;
+  const chatDiscountPercent = mentorProfile.rows[0]?.chat_discount_percent;
 
   const promotedType = promoted.requested_session_type || "chat";
+
+  // Apply mentor's universal chat discount for chat sessions.
+  // The platform first-session promo (intro_rate) overrides this when applicable.
+  let ratePerMinute = baseRate;
+  if (promotedType === 'video') {
+    ratePerMinute = baseRate * 1.5;
+  } else if (promotedType === 'chat' && chatDiscountPercent != null) {
+    ratePerMinute = baseRate * (1 - chatDiscountPercent / 100);
+  }
 
   // Get billing type for promoted session
   const promotedSession = await db.query(
@@ -1710,14 +1738,12 @@ async function promoteNextPendingSession(db, mentorId) {
   let promotedNormalRate = undefined;
 
   if (promotedBillingType === 'intro_rate') {
-    const mentorDiscount = await db.query(
-      `SELECT intro_discount_percent FROM mentor_profile WHERE user_id = $1`,
-      [mentorId]
+    // Flat rate from promo_config; mentor's chat discount is overridden.
+    const cfgRow = await db.query(
+      `SELECT intro_rate_per_minute FROM promo_config WHERE id = 1`
     );
-    const discountPercent = mentorDiscount.rows[0]?.intro_discount_percent;
-    if (discountPercent != null) {
-      promotedEffectiveRate = ratePerMinute * (1 - discountPercent / 100);
-    }
+    promotedEffectiveRate = parseFloat(cfgRow.rows[0]?.intro_rate_per_minute) || 0;
+    // Strikethrough rate: what mentee would pay without the promo (ratePerMinute is post-chat-discount).
     promotedNormalRate = ratePerMinute;
   }
 
@@ -1767,9 +1793,9 @@ async function handleFreeChat(menteeId, event) {
   }
   const cfg = configResult.rows[0];
 
-  // 2. Check mentee eligibility
+  // 2. Check mentee eligibility (free_chat_session_id IS NOT NULL ⇔ already consumed).
   const promoResult = await db.query(
-    `SELECT free_chat_used FROM mentee_promo_status WHERE user_id = $1`,
+    `SELECT free_chat_session_id FROM mentee_promo_status WHERE user_id = $1`,
     [menteeId]
   );
 
@@ -1779,7 +1805,7 @@ async function handleFreeChat(menteeId, event) {
       `INSERT INTO mentee_promo_status (user_id) VALUES ($1) ON CONFLICT DO NOTHING`,
       [menteeId]
     );
-  } else if (promoResult.rows[0].free_chat_used) {
+  } else if (promoResult.rows[0].free_chat_session_id != null) {
     return respond(409, { error: "Free chat already used" });
   }
 
@@ -1973,13 +1999,13 @@ async function handleFreeChatAvailability(menteeId, event) {
   }
   const cfg = configResult.rows[0];
 
-  // 2. Check mentee eligibility
+  // 2. Check mentee eligibility (free_chat_session_id IS NOT NULL ⇔ already consumed).
   const promoResult = await db.query(
-    `SELECT free_chat_used FROM mentee_promo_status WHERE user_id = $1`,
+    `SELECT free_chat_session_id FROM mentee_promo_status WHERE user_id = $1`,
     [menteeId]
   );
 
-  if (promoResult.rows.length > 0 && promoResult.rows[0].free_chat_used) {
+  if (promoResult.rows.length > 0 && promoResult.rows[0].free_chat_session_id != null) {
     return respond(200, { available: false, reason: "already_used" });
   }
 
