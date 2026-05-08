@@ -566,7 +566,6 @@ async function handleSessionRequest(menteeId, event) {
      JOIN mentor_profile mp ON mp.user_id = u.id
      JOIN mentorship_application ma ON ma.user_id = u.id
      WHERE u.id = $1
-       AND u.role = 'mentor'
        AND u.account_status = 'active'
        AND ma.submission_status = 'approved'`,
     [mentor_id]
