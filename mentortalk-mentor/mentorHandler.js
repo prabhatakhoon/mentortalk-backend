@@ -279,6 +279,10 @@ export const handler = async (event) => {
         return await profilePhotoConfirm(userId, event);
       }
 
+      if (path === '/mentor/profile/acknowledge-rules' && method === 'POST') {
+        return await acknowledgeRules(userId);
+      }
+
       if (method === "GET" && path === "/mentor/launch-info") {
         const launchDate = process.env.LAUNCH_DATE || null;
         if (!launchDate) return respond(200, { launch_date: null });
@@ -355,6 +359,7 @@ async function getProfile(userId) {
        mp.profile_photo_url, mp.bio, mp.rate_per_minute,
        mp.is_available, mp.pref_audio, mp.pref_video,
        mp.intro_discount_percent,
+       mp.rules_acknowledged_at,
        mw.balance AS wallet_balance, mp.avg_rating, mp.total_reviews,
        mp.unlocked_tier_id,
        rt.name AS tier_name, rt.max_rate AS tier_max_rate,
@@ -400,6 +405,7 @@ LEFT JOIN user_language ul ON ul.user_id = u.id AND ul.role = 'mentor'
     intro_rate_per_minute: row.intro_discount_percent != null
       ? parseFloat(row.rate_per_minute) * (1 - row.intro_discount_percent / 100)
       : null,
+    rules_acknowledged_at: row.rules_acknowledged_at,
     is_available: row.is_available,
     pref_audio: row.pref_audio,
     pref_video: row.pref_video,
@@ -557,6 +563,27 @@ async function updateProfile(userId, event) {
   }
   // Return full profile (getProfile already joins user_language)
   return await getProfile(userId);
+}
+
+// ─── POST /mentor/profile/acknowledge-rules ──────────────────
+// mentor_profile: rules_acknowledged_at
+// Idempotent: COALESCE preserves the original ack timestamp on re-calls,
+// so the first acknowledgment is the legal record.
+
+async function acknowledgeRules(userId) {
+  const db = await getPool();
+  const result = await db.query(
+    `UPDATE mentor_profile
+        SET rules_acknowledged_at = COALESCE(rules_acknowledged_at, NOW()),
+            updated_at = NOW()
+      WHERE user_id = $1
+      RETURNING rules_acknowledged_at`,
+    [userId]
+  );
+  if (result.rows.length === 0) {
+    return respond(404, { error: "Mentor profile not found" });
+  }
+  return respond(200, { rules_acknowledged_at: result.rows[0].rules_acknowledged_at });
 }
 
 // ─── PUT /mentor/availability ────────────────────────────────
