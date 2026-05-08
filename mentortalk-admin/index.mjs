@@ -690,7 +690,7 @@ const handlers = {
       `SELECT
          u.id,
          u.phone_number,
-         u.role,
+         u.registered_as,
          u.account_status,
          u.banned_at,
          u.ban_reason,
@@ -716,7 +716,7 @@ const handlers = {
         users: result.rows.map((r) => ({
           id: r.id,
           phone_number: r.phone_number,
-          role: r.role,
+          registered_as: r.registered_as,
           account_status: r.account_status,
           display_name: r.display_name?.trim() || null,
           username: r.username || null,
@@ -742,7 +742,7 @@ const handlers = {
           `SELECT
            u.id,
            u.phone_number,
-           u.role,
+           u.registered_as,
            u.account_status,
            u.banned_at,
            u.ban_reason,
@@ -798,7 +798,7 @@ const handlers = {
       body: {
         id: user.id,
         phone_number: user.phone_number,
-        role: user.role,
+        registered_as: user.registered_as,
         account_status: user.account_status,
         display_name: user.display_name?.trim() || null,
         username: user.username || null,
@@ -976,13 +976,13 @@ const handlers = {
           CONCAT(rp_mentor.first_name, ' ', rp_mentor.last_name),
           CONCAT(rp_mentee.first_name, ' ', rp_mentee.last_name)
         ) AS reporter_name,
-        ru_reporter.role AS reporter_role,
+        ru_reporter.registered_as AS reporter_role,
         r.reported_id,
         COALESCE(
           CONCAT(rd_mentor.first_name, ' ', rd_mentor.last_name),
           CONCAT(rd_mentee.first_name, ' ', rd_mentee.last_name)
         ) AS reported_name,
-        ru_reported.role AS reported_role,
+        ru_reported.registered_as AS reported_role,
         ru_reported.account_status AS reported_account_status,
         (SELECT COUNT(*)::int FROM report WHERE reported_id = r.reported_id) AS reported_total_reports
       FROM report r
@@ -1191,7 +1191,7 @@ const handlers = {
     const result = await db.query(
       `SELECT
          t.id, t.ticket_number, t.user_id, t.status, t.created_at, t.resolved_at,
-         u.phone_number, u.role,
+         u.phone_number, u.registered_as,
          COALESCE(
            NULLIF(TRIM(CONCAT(mp.first_name, ' ', mp.last_name)), ''),
            NULLIF(TRIM(CONCAT(menp.first_name, ' ', menp.last_name)), '')
@@ -1234,7 +1234,7 @@ const handlers = {
         user: {
           name: row.user_name?.trim() || null,
           phone: row.phone_number,
-          role: row.role,
+          registered_as: row.registered_as,
           avatar: row.user_avatar || null,
         },
         last_message: lastMsg.rows[0]
@@ -1278,7 +1278,7 @@ const handlers = {
     const ticket = await db.query(
       `SELECT t.id, t.user_id, t.status,
               COALESCE(NULLIF(TRIM(CONCAT(mp.first_name, ' ', mp.last_name)), ''), NULLIF(TRIM(CONCAT(menp.first_name, ' ', menp.last_name)), '')) AS user_name,
-              u.phone_number, u.role
+              u.phone_number, u.registered_as
        FROM support_ticket t
        JOIN "user" u ON u.id = t.user_id
        LEFT JOIN mentor_profile mp ON mp.user_id = t.user_id
@@ -1305,7 +1305,7 @@ const handlers = {
           status: ticket.rows[0].status,
           user_name: ticket.rows[0].user_name?.trim() || null,
           phone: ticket.rows[0].phone_number,
-          role: ticket.rows[0].role,
+          registered_as: ticket.rows[0].registered_as,
         },
         messages: result.rows.map((row) => ({
           message_id: row.id,
