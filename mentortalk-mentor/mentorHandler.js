@@ -272,11 +272,17 @@ export const handler = async (event) => {
     }
 
 
+    // Used for both the avatar (PUT /mentor/profile sets profile_photo_url)
+    // and mentor extra photos (POST /mentor/photos inserts mentor_photo row).
     if (path === '/mentor/profile/photo/presign' && method === 'POST') {
         return await profilePhotoPresign(userId, event);
       }
-      if (path === '/mentor/profile/photo/confirm' && method === 'POST') {
-        return await profilePhotoConfirm(userId, event);
+
+      if (method === 'POST' && path === '/mentor/photos') {
+        return await addMentorPhoto(userId, event);
+      }
+      if (method === 'DELETE' && path.match(/^\/mentor\/photos\/[^/]+$/)) {
+        return await deleteMentorPhoto(userId, event);
       }
 
       if (path === '/mentor/profile/acknowledge-rules' && method === 'POST') {
@@ -390,12 +396,25 @@ LEFT JOIN user_language ul ON ul.user_id = u.id AND ul.role = 'mentor'
 
   const row = result.rows[0];
 
+  const photosResult = await db.query(
+    `SELECT id, photo_url, sort_order
+     FROM mentor_photo
+     WHERE user_id = $1
+     ORDER BY sort_order ASC`,
+    [userId]
+  );
+  const photos = photosResult.rows.map((p) => ({
+    id: p.id,
+    url: toFullUrl(p.photo_url),
+  }));
+
   return respond(200, {
     id: row.id,
     first_name: row.first_name,
     last_name: row.last_name,
     phone_number: row.phone_number,
     profile_image_url: toFullUrl(row.profile_photo_url),
+    photos,
     bio: row.bio,
     rate_per_minute: row.rate_per_minute ? parseFloat(row.rate_per_minute) : null,
     video_rate_per_minute: row.rate_per_minute
@@ -1946,6 +1965,120 @@ async function profilePhotoPresign(userId, event) {
     s3_key: s3Key,
     expires_in: 300,
   });
+}
+
+// ─── POST /mentor/photos ─────────────────────────────────────
+// Body: { s3_key }
+// Inserts one mentor_photo row at the next sort_order. Caps at 5 (422).
+
+async function addMentorPhoto(userId, event) {
+  const body = JSON.parse(event.body || "{}");
+  const s3Key = (body.s3_key || "").trim();
+
+  if (!s3Key) {
+    return respond(400, { error: "s3_key is required" });
+  }
+  if (!s3Key.startsWith(`profile-photos/${userId}/`)) {
+    return respond(400, { error: "s3_key does not belong to this user" });
+  }
+
+  const db = await getPool();
+
+  const countResult = await db.query(
+    `SELECT COUNT(*)::int AS count FROM mentor_photo WHERE user_id = $1`,
+    [userId]
+  );
+  if (countResult.rows[0].count >= 5) {
+    return respond(422, { error: "Maximum 5 photos allowed" });
+  }
+
+  const nextOrderResult = await db.query(
+    `SELECT COALESCE(MAX(sort_order) + 1, 0) AS next_order
+     FROM mentor_photo WHERE user_id = $1`,
+    [userId]
+  );
+  const nextOrder = nextOrderResult.rows[0].next_order;
+
+  const insertResult = await db.query(
+    `INSERT INTO mentor_photo (user_id, photo_url, sort_order)
+     VALUES ($1, $2, $3)
+     RETURNING id, photo_url, sort_order, created_at`,
+    [userId, s3Key, nextOrder]
+  );
+  const row = insertResult.rows[0];
+
+  return respond(201, {
+    id: row.id,
+    url: toFullUrl(row.photo_url),
+    sort_order: row.sort_order,
+  });
+}
+
+// ─── DELETE /mentor/photos/:id ───────────────────────────────
+// Verifies ownership, deletes the S3 object, deletes the row, and
+// resequences remaining sort_order values to stay contiguous.
+
+async function deleteMentorPhoto(userId, event) {
+  const photoId = event.pathParameters?.id
+    || event.path.split("/").pop();
+
+  if (!photoId) {
+    return respond(400, { error: "photo id is required" });
+  }
+
+  const db = await getPool();
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+
+    const found = await client.query(
+      `SELECT id, photo_url, sort_order
+       FROM mentor_photo
+       WHERE id = $1 AND user_id = $2`,
+      [photoId, userId]
+    );
+    if (found.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return respond(404, { error: "Photo not found" });
+    }
+    const { photo_url: s3Key, sort_order: removedOrder } = found.rows[0];
+
+    await client.query(
+      `DELETE FROM mentor_photo WHERE id = $1 AND user_id = $2`,
+      [photoId, userId]
+    );
+
+    // Resequence: shift every photo after the removed one down by 1 so
+    // sort_order stays contiguous starting at 0. UNIQUE(user_id, sort_order)
+    // means we have to either DEFER the constraint or shift in ascending
+    // order — Postgres rewrites a single UPDATE atomically, so this works.
+    await client.query(
+      `UPDATE mentor_photo
+       SET sort_order = sort_order - 1
+       WHERE user_id = $1 AND sort_order > $2`,
+      [userId, removedOrder]
+    );
+
+    await client.query("COMMIT");
+
+    // Best-effort S3 cleanup. If S3 fails we don't roll back the DB delete —
+    // an orphan object is recoverable; an undeletable row is not.
+    try {
+      await s3Client.send(new DeleteObjectCommand({
+        Bucket: BUCKET_NAME,
+        Key: s3Key,
+      }));
+    } catch (e) {
+      console.error("[deleteMentorPhoto] S3 delete failed", { s3Key, error: e.message });
+    }
+
+    return respond(200, { id: photoId });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 // ─── GET /mentor/quick-replies ───────────────────────────────
