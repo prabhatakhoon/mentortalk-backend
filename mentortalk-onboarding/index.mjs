@@ -240,13 +240,22 @@ const handlers = {
   submissionStatus: async (userId) => {
     const db = await getPool();
     const result = await db.query(
-      `SELECT submission_status FROM mentorship_application WHERE user_id = $1`,
+      `SELECT ma.submission_status, mp.rules_acknowledged_at
+         FROM mentorship_application ma
+         LEFT JOIN mentor_profile mp ON mp.user_id = ma.user_id
+        WHERE ma.user_id = $1`,
       [userId]
     );
     if (result.rows.length === 0) {
-      return { statusCode: 200, body: { status: "new" } };
+      return { statusCode: 200, body: { status: "new", rules_acknowledged_at: null } };
     }
-    return { statusCode: 200, body: { status: result.rows[0].submission_status } };
+    return {
+      statusCode: 200,
+      body: {
+        status: result.rows[0].submission_status,
+        rules_acknowledged_at: result.rows[0].rules_acknowledged_at,
+      },
+    };
   },
 
   // ──────────────────────────────────────────────────────────
