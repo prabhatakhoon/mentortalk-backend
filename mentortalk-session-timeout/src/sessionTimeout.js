@@ -206,13 +206,15 @@ export const handler = async (event) => {
 
     // 3b. Calculate splits
     let platformFee, mentorEarning;
-    if (session.billing_type === 'paid' && grossAmount > 0) {
-      // Platform takes 100% of minute 1, then 50/50 from minute 2 onward.
+    if ((session.billing_type === 'paid' || session.billing_type === 'intro_rate') && grossAmount > 0) {
+      // Platform takes 100% of minute 1 (at the first segment's rate), then 50/50 from minute 2 onward.
+      // Applies to both paid and the platform first-session promo (intro_rate).
       const firstMinuteRate = parseFloat(segRows.rows[0]?.rate_per_minute) || 0;
       const remainingAmount = Math.max(0, grossAmount - firstMinuteRate);
       mentorEarning = remainingAmount * 0.5;
       platformFee = grossAmount - mentorEarning;
     } else {
+      // free_intro path — gross is 0, split is moot.
       platformFee = grossAmount * 0.50;
       mentorEarning = grossAmount - platformFee;
     }
