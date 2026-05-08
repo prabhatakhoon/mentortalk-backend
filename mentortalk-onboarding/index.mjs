@@ -64,6 +64,56 @@ const removeEditableSubstep = async (userId, substep) => {
 };
 
 // ============================================================
+// Mentorship exclusion engine
+//
+// Interprets mentorship_exclusion edges with parent-child closure:
+// two nodes conflict if any pair drawn from {self, parent} on each
+// side has a direct edge in the table. The mentor app mirrors this
+// engine in Dart for UX gating; the Lambda is the authoritative side.
+// See learn/category_exclusion_graph_theory.md for the full model.
+// ============================================================
+
+const exclusionEdgeKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
+
+const exclusionConflictsWith = (a, b, edgeSet, parentMap) => {
+  if (a === b) return false;
+  const aNodes = parentMap[a] ? [a, parentMap[a]] : [a];
+  const bNodes = parentMap[b] ? [b, parentMap[b]] : [b];
+  for (const x of aNodes) {
+    for (const y of bNodes) {
+      if (x !== y && edgeSet.has(exclusionEdgeKey(x, y))) return true;
+    }
+  }
+  return false;
+};
+
+const exclusionFindViolations = (selectedIds, edgeSet, parentMap) => {
+  const arr = [...new Set(selectedIds)];
+  const violations = [];
+  for (let i = 0; i < arr.length; i++) {
+    for (let j = i + 1; j < arr.length; j++) {
+      if (exclusionConflictsWith(arr[i], arr[j], edgeSet, parentMap)) {
+        violations.push({ node_a: arr[i], node_b: arr[j] });
+      }
+    }
+  }
+  return violations;
+};
+
+const loadExclusionRule = async (db) => {
+  const [exResult, optResult] = await Promise.all([
+    db.query(`SELECT node_a, node_b FROM mentorship_exclusion`),
+    db.query(`SELECT id, category_id FROM mentorship_option WHERE is_active = true`),
+  ]);
+  const edgeSet = new Set(
+    exResult.rows.map((r) => exclusionEdgeKey(r.node_a, r.node_b))
+  );
+  const parentMap = {};
+  for (const r of optResult.rows) parentMap[r.id] = r.category_id;
+  return { edgeSet, parentMap };
+};
+
+// ============================================================
 // Handlers
 // ============================================================
 
@@ -476,6 +526,10 @@ const handlers = {
       `SELECT version FROM cache_metadata WHERE table_name = 'mentorship_category'`
     );
 
+    const exResult = await db.query(
+      `SELECT node_a, node_b FROM mentorship_exclusion`
+    );
+
     const categories = catResult.rows.map((cat) => ({
       id: cat.id,
       name: cat.name,
@@ -493,7 +547,14 @@ const handlers = {
 
     return {
       statusCode: 200,
-      body: { categories, version: versionResult.rows[0]?.version || 1 },
+      body: {
+        categories,
+        version: versionResult.rows[0]?.version || 1,
+        exclusions: exResult.rows.map((r) => ({
+          node_a: r.node_a,
+          node_b: r.node_b,
+        })),
+      },
     };
   },
 
@@ -520,6 +581,26 @@ const handlers = {
 
     const categoryIds = selected_categories.category_ids || [];
     const optionIds = selected_categories.option_ids || [];
+
+    // Authoritative validation: enforce mentor exclusion rules. Mentee role
+    // is unaffected — exclusions don't constrain mentee category interest.
+    if (role === 'mentor') {
+      const { edgeSet, parentMap } = await loadExclusionRule(db);
+      const violations = exclusionFindViolations(
+        [...categoryIds, ...optionIds],
+        edgeSet,
+        parentMap,
+      );
+      if (violations.length > 0) {
+        return {
+          statusCode: 400,
+          body: {
+            error: "Selection violates category exclusion rules",
+            conflicts: violations,
+          },
+        };
+      }
+    }
 
     await db.query(`DELETE FROM user_mentorship WHERE user_id = $1 AND role = $2`, [userId, role]);
 
