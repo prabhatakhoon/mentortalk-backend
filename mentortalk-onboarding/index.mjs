@@ -78,7 +78,7 @@ const handlers = {
       await Promise.all([
         db.query(`SELECT * FROM mentorship_application WHERE user_id = $1`, [userId]),
         db.query(
-          `SELECT aadhaar_pdf_url, aadhaar_verified, aadhaar_uploaded_at,
+          `SELECT aadhaar_file_url, aadhaar_verified, aadhaar_uploaded_at,
                   selfie_url, selfie_uploaded_at
            FROM identity_verification WHERE user_id = $1`,
           [userId]
@@ -183,9 +183,12 @@ const handlers = {
           is_complete: personalDetailsComplete && languages.rows.length > 0,
         },
         identity: {
-          aadhaar_uploaded: !!identityData.aadhaar_pdf_url || !!identityData.aadhaar_verified,
+          aadhaar_uploaded: !!identityData.aadhaar_file_url || !!identityData.aadhaar_verified,
           aadhaar_verified: !!identityData.aadhaar_verified,
-          aadhaar_pdf_url: identityData.aadhaar_pdf_url || null,
+          aadhaar_file_url: identityData.aadhaar_file_url || null,
+          // BACKCOMPAT: pre-v1.0.5 mentor app reads `aadhaar_pdf_url`. Drop
+          // this alias after the force-update has rolled out.
+          aadhaar_pdf_url: identityData.aadhaar_file_url || null,
           selfie_url: selfieUrl,
           selfie_uploaded: !!identityData.selfie_url,
         },
@@ -315,12 +318,24 @@ const handlers = {
   // POST /onboarding/identity/aadhaar/presign
   // ──────────────────────────────────────────────────────────
   aadhaarPresign: async (userId, body) => {
-    const { file_name } = body;
-    const s3Key = `aadhaar/${userId}/${Date.now()}-${file_name || "aadhaar.pdf"}`;
+    const { file_name, content_type } = body;
+    const ALLOWED_TYPES = ["application/pdf", "image/jpeg", "image/png"];
+    // BACKCOMPAT: pre-v1.0.5 mentor app omits content_type and uploads PDFs only.
+    // Default to application/pdf when absent. Drop this fallback after the
+    // force-update has rolled out and the old build is no longer in the wild.
+    const effectiveType = content_type || "application/pdf";
+    if (!ALLOWED_TYPES.includes(effectiveType)) {
+      return {
+        statusCode: 400,
+        body: { error: "Unsupported file type. Allowed: PDF, JPG, PNG." },
+      };
+    }
+    const safeName = file_name || (effectiveType === "application/pdf" ? "aadhaar.pdf" : "aadhaar");
+    const s3Key = `aadhaar/${userId}/${Date.now()}-${safeName}`;
     const command = new PutObjectCommand({
       Bucket: BUCKET_NAME,
       Key: s3Key,
-      ContentType: "application/pdf",
+      ContentType: effectiveType,
     });
     const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 });
 
@@ -343,10 +358,10 @@ const handlers = {
 
     // Upsert identity_verification row
     await db.query(
-      `INSERT INTO identity_verification (user_id, aadhaar_pdf_url, aadhaar_uploaded_at)
+      `INSERT INTO identity_verification (user_id, aadhaar_file_url, aadhaar_uploaded_at)
        VALUES ($1, $2, NOW())
        ON CONFLICT (user_id) DO UPDATE
-       SET aadhaar_pdf_url = $2, aadhaar_uploaded_at = NOW(), updated_at = NOW()`,
+       SET aadhaar_file_url = $2, aadhaar_uploaded_at = NOW(), updated_at = NOW()`,
       [userId, s3_key]
     );
 
@@ -418,10 +433,10 @@ const handlers = {
 
     // Verify aadhaar uploaded
     const identity = await db.query(
-      `SELECT aadhaar_pdf_url, selfie_url FROM identity_verification WHERE user_id = $1`,
+      `SELECT aadhaar_file_url, selfie_url FROM identity_verification WHERE user_id = $1`,
       [userId]
     );
-    if (identity.rows.length === 0 || !identity.rows[0].aadhaar_pdf_url) {
+    if (identity.rows.length === 0 || !identity.rows[0].aadhaar_file_url) {
       return { statusCode: 400, body: { error: "Aadhaar not uploaded" } };
     }
     if (!identity.rows[0].selfie_url) {
