@@ -197,7 +197,7 @@ async function formatMentorRow(row) {
           ? parseFloat(row.rate_per_minute) * VIDEO_RATE_MULTIPLIER
           : null,
         is_available: row.is_available ?? false,
-        intro_rate_eligible: row.intro_rate_eligible ?? false,
+        intro_promo_eligible: false, // overridden by caller after per-mentor eligibility check
       };
 }
 
@@ -215,18 +215,26 @@ async function getBlockedIds(db, userId) {
   return rows.map(r => r.blocked_id || r.blocker_id);
 }
 
+// Returns mentee-side eligibility for the platform first-session promo plus the
+// flat per-minute promo rate. Per-mentor eligibility (`intro_promo_enabled`)
+// is checked separately by each caller.
 async function getMenteeIntroEligible(db, userId) {
   const { rows } = await db.query(
     `SELECT
-       COALESCE(mps.intro_session_used, TRUE) AS intro_used,
-       COALESCE(pc.intro_rate_enabled, FALSE) AS intro_enabled
+       (mps.intro_session_id IS NULL)              AS intro_unused,
+       COALESCE(pc.intro_rate_enabled, FALSE)      AS intro_enabled,
+       pc.intro_rate_per_minute                    AS intro_rate_per_minute
      FROM (SELECT 1) AS dummy
      LEFT JOIN mentee_promo_status mps ON mps.user_id = $1
      LEFT JOIN promo_config pc ON pc.id = 1`,
     [userId]
   );
-  if (rows.length === 0) return false;
-  return !rows[0].intro_used && rows[0].intro_enabled;
+  if (rows.length === 0) return { eligible: false, ratePerMinute: 0 };
+  // intro_unused is NULL when the mentee has no mentee_promo_status row yet
+  // (treat that as "not eligible" — onboarding creates the row).
+  const eligible = !!rows[0].intro_unused && !!rows[0].intro_enabled;
+  const ratePerMinute = parseFloat(rows[0].intro_rate_per_minute) || 0;
+  return { eligible, ratePerMinute };
 }
 
 // ============================================================
@@ -321,7 +329,7 @@ function parseFilterParams(queryParams) {
  * 4. Rank by popularity score (rating + session count)
  * 5. Return with presigned photo URLs
  */
-async function getPopularMentors(db, userId, queryParams, blockedIds = [], menteeIntroEligible = false) {
+async function getPopularMentors(db, userId, queryParams, blockedIds = [], menteeIntroPromo = { eligible: false, ratePerMinute: 0 }) {
   const limit = Math.min(Math.max(parseInt(queryParams.limit || "10"), 1), 50);
   const offset = Math.max(parseInt(queryParams.offset || "0"), 0);
   const { sortBy, gender, categories, type, languages } = parseFilterParams(queryParams);
@@ -400,7 +408,8 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
          mp.profile_photo_url,
          mp.rate_per_minute,
         mp.is_available,
-         mp.intro_discount_percent,
+         mp.chat_discount_percent,
+         mp.intro_promo_enabled,
          COALESCE(mp.avg_rating, 0)     AS avg_rating,
 
          COALESCE(mp.total_reviews, 0)  AS total_reviews,
@@ -446,7 +455,8 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
        total_sessions,
        rate_per_minute,
         is_available,
-       intro_discount_percent,
+       chat_discount_percent,
+       intro_promo_enabled,
        popularity_score,
        COUNT(*) OVER() AS total_count
      FROM scored
@@ -464,12 +474,13 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
 
   for (let i = 0; i < mentors.length; i++) {
     const row = result.rows[i];
-    const eligible = menteeIntroEligible && row.intro_discount_percent != null;
-    mentors[i].intro_rate_eligible = eligible;
-    mentors[i].intro_discount_percent = row.intro_discount_percent;
-    mentors[i].intro_rate_per_minute = eligible
-      ? parseFloat(row.rate_per_minute) * (1 - row.intro_discount_percent / 100)
+    const promoEligible = menteeIntroPromo.eligible && !!row.intro_promo_enabled;
+    mentors[i].chat_discount_percent = row.chat_discount_percent;
+    mentors[i].discounted_rate_per_minute = row.chat_discount_percent != null
+      ? parseFloat(row.rate_per_minute) * (1 - row.chat_discount_percent / 100)
       : null;
+    mentors[i].intro_promo_eligible = promoEligible;
+    mentors[i].intro_promo_rate_per_minute = promoEligible ? menteeIntroPromo.ratePerMinute : null;
   }
 
   // Batch presence check — add is_online to each mentor
@@ -507,7 +518,7 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
  *   ?q=Pr&categories=neet                           → search within NEET mentors
  *   ?categories=jee&sort_by=price_asc&gender=female → filtered + sorted
  */
-async function searchMentors(db, queryParams, blockedIds = [], menteeIntroEligible = false) {
+async function searchMentors(db, queryParams, blockedIds = [], menteeIntroPromo = { eligible: false, ratePerMinute: 0 }) {
   const q = (queryParams.q || "").trim();
   const { sortBy, gender, categories, languages } = parseFilterParams(queryParams);
   const limit = Math.min(Math.max(parseInt(queryParams.limit || "20"), 1), 50);
@@ -592,7 +603,8 @@ if (languages.length > 0) {
        mp.profile_photo_url,
        mp.rate_per_minute,
       mp.is_available,
-       mp.intro_discount_percent,
+       mp.chat_discount_percent,
+       mp.intro_promo_enabled,
        COALESCE(mp.avg_rating, 0)    AS avg_rating,
        COALESCE(mp.total_reviews, 0) AS total_reviews,
 
@@ -616,7 +628,7 @@ if (languages.length > 0) {
      WHERE ${conditions.join("\n       AND ")}
     GROUP BY u.id, mp.first_name, mp.last_name,
               mp.profile_photo_url, mp.rate_per_minute, mp.is_available,
-             mp.avg_rating, mp.total_reviews, mp.intro_discount_percent
+             mp.avg_rating, mp.total_reviews, mp.chat_discount_percent, mp.intro_promo_enabled
      ORDER BY ${orderClause}
      LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
     params
@@ -631,12 +643,13 @@ if (languages.length > 0) {
 
   for (let i = 0; i < mentors.length; i++) {
     const row = result.rows[i];
-    const eligible = menteeIntroEligible && row.intro_discount_percent != null;
-    mentors[i].intro_rate_eligible = eligible;
-    mentors[i].intro_discount_percent = row.intro_discount_percent;
-    mentors[i].intro_rate_per_minute = eligible
-      ? parseFloat(row.rate_per_minute) * (1 - row.intro_discount_percent / 100)
+    const promoEligible = menteeIntroPromo.eligible && !!row.intro_promo_enabled;
+    mentors[i].chat_discount_percent = row.chat_discount_percent;
+    mentors[i].discounted_rate_per_minute = row.chat_discount_percent != null
+      ? parseFloat(row.rate_per_minute) * (1 - row.chat_discount_percent / 100)
       : null;
+    mentors[i].intro_promo_eligible = promoEligible;
+    mentors[i].intro_promo_rate_per_minute = promoEligible ? menteeIntroPromo.ratePerMinute : null;
   }
 
   // Batch presence check
@@ -720,7 +733,7 @@ const LANGUAGE_MAP = {
 // identity_verification, 
 // ============================================================
 
-async function getMentorProfile(db, userId, queryParams, menteeIntroEligible = false) {
+async function getMentorProfile(db, userId, queryParams, menteeIntroPromo = { eligible: false, ratePerMinute: 0 }) {
   const mentorId = (queryParams.mentor_id || "").trim();
 
   if (!mentorId) {
@@ -742,7 +755,8 @@ async function getMentorProfile(db, userId, queryParams, menteeIntroEligible = f
        mp.pref_video,
        mp.avg_rating,
         mp.total_reviews,
-       mp.intro_discount_percent,
+       mp.chat_discount_percent,
+       mp.intro_promo_enabled,
 
        -- Completed sessions count
        (SELECT COUNT(*)
@@ -898,10 +912,13 @@ async function getMentorProfile(db, userId, queryParams, menteeIntroEligible = f
       ? parseFloat(row.rate_per_minute) * VIDEO_RATE_MULTIPLIER
       : null,
     is_available: row.is_available ?? false,
-    intro_rate_eligible: menteeIntroEligible && row.intro_discount_percent != null,
-    intro_discount_percent: row.intro_discount_percent,
-    intro_rate_per_minute: (menteeIntroEligible && row.intro_discount_percent != null)
-      ? parseFloat(row.rate_per_minute) * (1 - row.intro_discount_percent / 100)
+    chat_discount_percent: row.chat_discount_percent,
+    discounted_rate_per_minute: row.chat_discount_percent != null
+      ? parseFloat(row.rate_per_minute) * (1 - row.chat_discount_percent / 100)
+      : null,
+    intro_promo_eligible: menteeIntroPromo.eligible && !!row.intro_promo_enabled,
+    intro_promo_rate_per_minute: (menteeIntroPromo.eligible && !!row.intro_promo_enabled)
+      ? menteeIntroPromo.ratePerMinute
       : null,
     pref_audio: row.pref_audio ?? true,
     pref_video: row.pref_video ?? true,
@@ -961,7 +978,7 @@ async function toggleFollow(db, userId, body) {
 // Query: ?limit=20&offset=0
 // ============================================================
 
-async function getFollowing(db, userId, queryParams, menteeIntroEligible = false) {
+async function getFollowing(db, userId, queryParams, menteeIntroPromo = { eligible: false, ratePerMinute: 0 }) {
   const limit = Math.min(Math.max(parseInt(queryParams.limit || "20"), 1), 50);
   const offset = Math.max(parseInt(queryParams.offset || "0"), 0);
 
@@ -973,7 +990,8 @@ async function getFollowing(db, userId, queryParams, menteeIntroEligible = false
        mp.profile_photo_url,
        mp.rate_per_minute,
          mp.is_available,
-       mp.intro_discount_percent,
+       mp.chat_discount_percent,
+       mp.intro_promo_enabled,
        COALESCE(mp.avg_rating, 0) AS avg_rating,
        COALESCE(mp.total_reviews, 0) AS total_reviews,
        (SELECT COUNT(*) FROM session s WHERE s.mentor_id = f.mentor_id AND s.status = 'completed') AS total_sessions,
@@ -1011,12 +1029,13 @@ async function getFollowing(db, userId, queryParams, menteeIntroEligible = false
 
   for (let i = 0; i < mentors.length; i++) {
     const row = result.rows[i];
-    const eligible = menteeIntroEligible && row.intro_discount_percent != null;
-    mentors[i].intro_rate_eligible = eligible;
-    mentors[i].intro_discount_percent = row.intro_discount_percent;
-    mentors[i].intro_rate_per_minute = eligible
-      ? parseFloat(row.rate_per_minute) * (1 - row.intro_discount_percent / 100)
+    const promoEligible = menteeIntroPromo.eligible && !!row.intro_promo_enabled;
+    mentors[i].chat_discount_percent = row.chat_discount_percent;
+    mentors[i].discounted_rate_per_minute = row.chat_discount_percent != null
+      ? parseFloat(row.rate_per_minute) * (1 - row.chat_discount_percent / 100)
       : null;
+    mentors[i].intro_promo_eligible = promoEligible;
+    mentors[i].intro_promo_rate_per_minute = promoEligible ? menteeIntroPromo.ratePerMinute : null;
   }
 
  // Batch presence check
@@ -1160,7 +1179,7 @@ export const handler = async (event) => {
 
     const db = await getClient();
       const blockedIds = await getBlockedIds(db, userId);
-    const menteeIntroEligible = await getMenteeIntroEligible(db, userId);
+    const menteeIntroPromo = await getMenteeIntroEligible(db, userId);
 
     // Banners
     if (method === "GET" && path.endsWith("/banners")) {
@@ -1168,11 +1187,11 @@ export const handler = async (event) => {
     }
     // Popular mentors
     if (method === "GET" && path.endsWith("/popular-mentors")) {
-  return await getPopularMentors(db, userId, queryParams, blockedIds, menteeIntroEligible);    }
+  return await getPopularMentors(db, userId, queryParams, blockedIds, menteeIntroPromo);    }
 
     // Search mentors
     if (method === "GET" && path.endsWith("/search-mentors")) {
-           return await searchMentors(db, queryParams, blockedIds, menteeIntroEligible);
+           return await searchMentors(db, queryParams, blockedIds, menteeIntroPromo);
 
     }
 
@@ -1188,7 +1207,7 @@ export const handler = async (event) => {
 
     // Mentor profile (full detail page)
     if (method === "GET" && path.endsWith("/mentor-profile")) {
-      return await getMentorProfile(db, userId, queryParams, menteeIntroEligible);
+      return await getMentorProfile(db, userId, queryParams, menteeIntroPromo);
     }
 
     // Toggle follow
@@ -1201,7 +1220,7 @@ export const handler = async (event) => {
 
     // Following list
     if (method === "GET" && path.endsWith("/following")) {
-      return await getFollowing(db, userId, queryParams, menteeIntroEligible);
+      return await getFollowing(db, userId, queryParams, menteeIntroPromo);
     }
 ```
 
