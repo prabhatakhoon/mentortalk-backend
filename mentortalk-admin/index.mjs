@@ -8,7 +8,7 @@ import {
   GetObjectCommand,
 } from "@aws-sdk/client-s3";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import {
   ApiGatewayManagementApiClient,
   PostToConnectionCommand,
@@ -25,6 +25,55 @@ const dynamoClient = DynamoDBDocumentClient.from(
 );
 const BUCKET_NAME = "mentortalk-storage-prod";
 const WS_ENDPOINT = process.env.WS_ENDPOINT;
+
+// App config (DynamoDB) — keys mirror the mentortalk-config Lambda reads.
+const APP_CONFIG_TABLE = "mentortalk-app-config";
+const APP_CONFIG_KEYS = [
+  "min_app_version_android",
+  "min_app_version_ios",
+  "maintenance_mode",
+  "feature_flags",
+];
+
+function validateAppConfig(key, value) {
+  const errors = [];
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    errors.push("Body must be a JSON object");
+    return errors;
+  }
+  if (key === "min_app_version_android" || key === "min_app_version_ios") {
+    for (const app of ["mentor", "mentee"]) {
+      const v = value[app];
+      if (!v || typeof v !== "object") {
+        errors.push(`${app} object is required`);
+        continue;
+      }
+      if (typeof v.version !== "string" || !/^\d+\.\d+\.\d+$/.test(v.version)) {
+        errors.push(`${app}.version must be in x.y.z format`);
+      }
+      if (typeof v.force !== "boolean") {
+        errors.push(`${app}.force must be a boolean`);
+      }
+    }
+  } else if (key === "maintenance_mode") {
+    for (const app of ["mentor", "mentee"]) {
+      const v = value[app];
+      if (!v || typeof v !== "object") {
+        errors.push(`${app} object is required`);
+        continue;
+      }
+      if (typeof v.enabled !== "boolean") {
+        errors.push(`${app}.enabled must be a boolean`);
+      }
+      if (typeof v.message !== "string") {
+        errors.push(`${app}.message must be a string`);
+      } else if (v.message.length > 500) {
+        errors.push(`${app}.message must be 500 characters or fewer`);
+      }
+    }
+  }
+  return errors;
+}
 
 let pool = null;
 let apiKeyConfig = null;
@@ -2712,6 +2761,46 @@ const handlers = {
       },
     };
   },
+
+  // ── App Config (DynamoDB: mentortalk-app-config) ─────────
+
+  getAppConfig: async (key) => {
+    if (!APP_CONFIG_KEYS.includes(key)) {
+      return { statusCode: 404, body: { error: `Unknown config key: ${key}` } };
+    }
+    const result = await dynamoClient.send(
+      new GetCommand({
+        TableName: APP_CONFIG_TABLE,
+        Key: { config_key: key },
+      }),
+    );
+    let parsedValue = null;
+    if (result.Item?.value) {
+      try {
+        parsedValue = JSON.parse(result.Item.value);
+      } catch {
+        parsedValue = result.Item.value;
+      }
+    }
+    return { statusCode: 200, body: { config_key: key, value: parsedValue } };
+  },
+
+  putAppConfig: async (key, body) => {
+    if (!APP_CONFIG_KEYS.includes(key)) {
+      return { statusCode: 404, body: { error: `Unknown config key: ${key}` } };
+    }
+    const errors = validateAppConfig(key, body);
+    if (errors.length > 0) {
+      return { statusCode: 400, body: { error: "Validation failed", errors } };
+    }
+    await dynamoClient.send(
+      new PutCommand({
+        TableName: APP_CONFIG_TABLE,
+        Item: { config_key: key, value: JSON.stringify(body) },
+      }),
+    );
+    return { statusCode: 200, body: { config_key: key, value: body } };
+  },
 };
 
 // ============================================================
@@ -2982,6 +3071,22 @@ export const handler = async (event) => {
     const retryMatch = path.match(/\/admin\/payouts\/([\w-]+)\/retry$/);
     if (retryMatch && method === "POST") {
       result = await handlers.payoutsRetry(retryMatch[1], body);
+      return respond(result);
+    }
+
+    // ── App Config ─────────────────────────────────────────
+
+    // GET /admin/config/:key
+    const configGetMatch = path.match(/\/admin\/config\/([\w-]+)$/);
+    if (configGetMatch && method === "GET") {
+      result = await handlers.getAppConfig(configGetMatch[1]);
+      return respond(result);
+    }
+
+    // PUT /admin/config/:key
+    const configPutMatch = path.match(/\/admin\/config\/([\w-]+)$/);
+    if (configPutMatch && method === "PUT") {
+      result = await handlers.putAppConfig(configPutMatch[1], body);
       return respond(result);
     }
 
