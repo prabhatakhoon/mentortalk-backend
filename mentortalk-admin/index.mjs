@@ -2386,7 +2386,7 @@ const handlers = {
     const minThresholdPaisa =
       body.min_threshold_paisa !== undefined
         ? parseInt(body.min_threshold_paisa)
-        : 50000;
+        : 10000;
     if (isNaN(minThresholdPaisa) || minThresholdPaisa < 0) {
       return {
         statusCode: 400,
