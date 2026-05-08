@@ -2090,7 +2090,7 @@ async function getPayoutsSummary(userId) {
   // Suspended users: omit next_payout entirely. Frontend treats missing field
   // as "don't render the card."
   if (row.account_status === "active") {
-    const minThresholdPaisa = 50000;
+    const minThresholdPaisa = 10000;
     const minThresholdInr = minThresholdPaisa / 100;
     const balanceInr = parseFloat(row.wallet_balance ?? 0);
     const balancePaisa = Math.round(balanceInr * 100);
