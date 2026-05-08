@@ -836,6 +836,21 @@ async function getMentorProfile(db, userId, queryParams, menteeIntroEligible = f
   // ── 6. Resolve photo ──
   const photoUrl = await resolvePhotoUrl(row.profile_photo_url, mentorId);
 
+  // ── 6b. Mentor extra photos (max 5) ──
+  const photosResult = await db.query(
+    `SELECT id, photo_url
+     FROM mentor_photo
+     WHERE user_id = $1
+     ORDER BY sort_order ASC`,
+    [mentorId]
+  );
+  const photos = await Promise.all(
+    photosResult.rows.map(async (p) => ({
+      id: p.id,
+      url: await resolvePhotoUrl(p.photo_url, mentorId),
+    }))
+  );
+
   // ── 7. Build display name ──
   const displayName = [row.first_name, row.last_name]
     .filter(Boolean)
@@ -875,6 +890,7 @@ async function getMentorProfile(db, userId, queryParams, menteeIntroEligible = f
     id: mentorId,
     display_name: displayName || row.first_name || "Mentor",
     profile_photo_url: photoUrl,
+    photos,
     gender: row.gender || null,
     bio: row.bio || null,
     rate_per_minute: parseInt(row.rate_per_minute) || 0,
