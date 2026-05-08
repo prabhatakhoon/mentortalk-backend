@@ -379,13 +379,13 @@ const handlers = {
         [applicationId],
       );
 
-      // Delete Aadhaar PDF from S3 (UIDAI compliance)
-      await deleteAadhaarPdf(appData.user_id);
+      // Delete Aadhaar file from S3 (UIDAI compliance)
+      await deleteAadhaarFile(appData.user_id);
 
       // Mark aadhaar as verified
       await db.query(
         `UPDATE identity_verification
-         SET aadhaar_verified = true, aadhaar_pdf_url = NULL, updated_at = NOW()
+         SET aadhaar_verified = true, aadhaar_file_url = NULL, updated_at = NOW()
          WHERE user_id = $1`,
         [appData.user_id],
       );
@@ -531,12 +531,12 @@ const handlers = {
     const userId = app.rows[0].user_id;
 
     // Delete from S3
-    await deleteAadhaarPdf(userId);
+    await deleteAadhaarFile(userId);
 
     // Update DB
     await db.query(
       `UPDATE identity_verification
-       SET aadhaar_verified = true, aadhaar_pdf_url = NULL, updated_at = NOW()
+       SET aadhaar_verified = true, aadhaar_file_url = NULL, updated_at = NOW()
        WHERE user_id = $1`,
       [userId],
     );
@@ -564,7 +564,7 @@ const handlers = {
     const userId = app.rows[0].user_id;
 
     const identity = await db.query(
-      `SELECT aadhaar_pdf_url, selfie_url, aadhaar_verified
+      `SELECT aadhaar_file_url, selfie_url, aadhaar_verified
        FROM identity_verification WHERE user_id = $1`,
       [userId],
     );
@@ -578,11 +578,11 @@ const handlers = {
     const identityData = identity.rows[0] || {};
     const files = {};
 
-    // Presign aadhaar PDF
-    if (identityData.aadhaar_pdf_url) {
+    // Presign aadhaar file
+    if (identityData.aadhaar_file_url) {
       const command = new GetObjectCommand({
         Bucket: BUCKET_NAME,
-        Key: identityData.aadhaar_pdf_url,
+        Key: identityData.aadhaar_file_url,
       });
       files.aadhaar_url = await getSignedUrl(s3Client, command, {
         expiresIn: 3600,
@@ -2807,20 +2807,20 @@ const handlers = {
 // Helpers
 // ============================================================
 
-const deleteAadhaarPdf = async (userId) => {
+const deleteAadhaarFile = async (userId) => {
   const db = await getPool();
   const identity = await db.query(
-    `SELECT aadhaar_pdf_url FROM identity_verification WHERE user_id = $1`,
+    `SELECT aadhaar_file_url FROM identity_verification WHERE user_id = $1`,
     [userId],
   );
 
-  const pdfUrl = identity.rows[0]?.aadhaar_pdf_url;
-  if (pdfUrl) {
+  const fileUrl = identity.rows[0]?.aadhaar_file_url;
+  if (fileUrl) {
     try {
       await s3Client.send(
-        new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: pdfUrl }),
+        new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: fileUrl }),
       );
-      console.log(`[S3] Deleted aadhaar PDF: ${pdfUrl}`);
+      console.log(`[S3] Deleted aadhaar file: ${fileUrl}`);
     } catch (e) {
       console.error(`[S3] Delete error:`, e);
     }
