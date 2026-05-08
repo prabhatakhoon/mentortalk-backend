@@ -2801,11 +2801,155 @@ const handlers = {
     );
     return { statusCode: 200, body: { config_key: key, value: body } };
   },
+
+  // ──────────────────────────────────────────────────────────
+  // GET /admin/mentorship/exclusions
+  // ──────────────────────────────────────────────────────────
+  listExclusions: async () => {
+    const db = await getPool();
+    const result = await db.query(
+      `SELECT node_a, node_b, created_at
+         FROM mentorship_exclusion
+        ORDER BY created_at`,
+    );
+    return {
+      statusCode: 200,
+      body: {
+        exclusions: result.rows.map((r) => ({
+          node_a: r.node_a,
+          node_b: r.node_b,
+          created_at: r.created_at,
+        })),
+      },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/mentorship/exclusions
+  // Body: { node_a, node_b }
+  // Idempotent: re-adding an existing edge returns 200 with created=false.
+  // ──────────────────────────────────────────────────────────
+  addExclusion: async (body) => {
+    const { node_a, node_b } = body || {};
+    if (
+      !node_a || !node_b ||
+      typeof node_a !== "string" || typeof node_b !== "string"
+    ) {
+      return {
+        statusCode: 400,
+        body: { error: "node_a and node_b are required strings" },
+      };
+    }
+    if (node_a === node_b) {
+      return {
+        statusCode: 400,
+        body: { error: "node_a and node_b must differ" },
+      };
+    }
+
+    // Canonical order matches the chk_canonical_order CHECK constraint.
+    const [a, b] = node_a < node_b ? [node_a, node_b] : [node_b, node_a];
+
+    const db = await getPool();
+
+    // Validate both ids exist in mentorship_category or mentorship_option.
+    const existsResult = await db.query(
+      `SELECT id FROM (
+         SELECT id FROM mentorship_category
+         UNION ALL
+         SELECT id FROM mentorship_option
+       ) n WHERE id = ANY($1)`,
+      [[a, b]],
+    );
+    const found = new Set(existsResult.rows.map((r) => r.id));
+    const missing = [a, b].filter((n) => !found.has(n));
+    if (missing.length > 0) {
+      return {
+        statusCode: 400,
+        body: { error: `Unknown node id(s): ${missing.join(", ")}` },
+      };
+    }
+
+    // Reject parent ↔ child edges — they'd make the child permanently
+    // unselectable since picking a sub auto-implies its parent.
+    const parentCheck = await db.query(
+      `SELECT id, category_id FROM mentorship_option WHERE id = ANY($1)`,
+      [[a, b]],
+    );
+    for (const row of parentCheck.rows) {
+      if (
+        (row.id === a && row.category_id === b) ||
+        (row.id === b && row.category_id === a)
+      ) {
+        return {
+          statusCode: 400,
+          body: { error: "Parent ↔ child edges are not allowed" },
+        };
+      }
+    }
+
+    try {
+      await db.query(
+        `INSERT INTO mentorship_exclusion (node_a, node_b) VALUES ($1, $2)`,
+        [a, b],
+      );
+    } catch (err) {
+      if (err && err.code === "23505") {
+        return {
+          statusCode: 200,
+          body: { node_a: a, node_b: b, created: false },
+        };
+      }
+      throw err;
+    }
+
+    await bumpCategoryCacheVersion(db);
+
+    return {
+      statusCode: 201,
+      body: { node_a: a, node_b: b, created: true },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // DELETE /admin/mentorship/exclusions/:nodeA/:nodeB
+  // Order of nodeA/nodeB in the path doesn't matter — the handler
+  // canonicalizes before lookup.
+  // ──────────────────────────────────────────────────────────
+  deleteExclusion: async (nodeA, nodeB) => {
+    if (!nodeA || !nodeB) {
+      return { statusCode: 400, body: { error: "Missing node ids" } };
+    }
+    if (nodeA === nodeB) {
+      return { statusCode: 400, body: { error: "node ids must differ" } };
+    }
+    const [a, b] = nodeA < nodeB ? [nodeA, nodeB] : [nodeB, nodeA];
+
+    const db = await getPool();
+    const result = await db.query(
+      `DELETE FROM mentorship_exclusion WHERE node_a = $1 AND node_b = $2`,
+      [a, b],
+    );
+
+    if (result.rowCount === 0) {
+      return { statusCode: 404, body: { error: "Edge not found" } };
+    }
+
+    await bumpCategoryCacheVersion(db);
+
+    return { statusCode: 200, body: { node_a: a, node_b: b, deleted: true } };
+  },
 };
 
 // ============================================================
 // Helpers
 // ============================================================
+
+const bumpCategoryCacheVersion = async (db) => {
+  await db.query(
+    `UPDATE cache_metadata SET version = version + 1 WHERE table_name = 'mentorship_category'`,
+  );
+};
 
 const deleteAadhaarFile = async (userId) => {
   const db = await getPool();
@@ -3071,6 +3215,38 @@ export const handler = async (event) => {
     const retryMatch = path.match(/\/admin\/payouts\/([\w-]+)\/retry$/);
     if (retryMatch && method === "POST") {
       result = await handlers.payoutsRetry(retryMatch[1], body);
+      return respond(result);
+    }
+
+    // ── Mentorship exclusions (rule editor) ────────────────
+
+    // GET /admin/mentorship/exclusions
+    if (
+      path.match(/\/admin\/mentorship\/exclusions\/?$/) &&
+      method === "GET"
+    ) {
+      result = await handlers.listExclusions();
+      return respond(result);
+    }
+
+    // POST /admin/mentorship/exclusions
+    if (
+      path.match(/\/admin\/mentorship\/exclusions\/?$/) &&
+      method === "POST"
+    ) {
+      result = await handlers.addExclusion(body);
+      return respond(result);
+    }
+
+    // DELETE /admin/mentorship/exclusions/:nodeA/:nodeB
+    const exclusionDeleteMatch = path.match(
+      /\/admin\/mentorship\/exclusions\/([\w-]+)\/([\w-]+)$/,
+    );
+    if (exclusionDeleteMatch && method === "DELETE") {
+      result = await handlers.deleteExclusion(
+        exclusionDeleteMatch[1],
+        exclusionDeleteMatch[2],
+      );
       return respond(result);
     }
 
