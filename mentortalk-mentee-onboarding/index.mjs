@@ -312,10 +312,12 @@ async function submitOnboarding(db, userId) {
     [userId]
   );
 
-  // Create mentee promo status (free chat + intro rate entitlements)
+  // Create mentee promo status row. Both entitlements (free_chat_session_id,
+  // intro_session_id) start NULL — FK presence is the source of truth for
+  // "consumed" since v014 dropped the redundant boolean flags.
   await db.query(
-    `INSERT INTO mentee_promo_status (user_id, free_chat_used, intro_session_used)
-     VALUES ($1, FALSE, FALSE)
+    `INSERT INTO mentee_promo_status (user_id)
+     VALUES ($1)
      ON CONFLICT (user_id) DO NOTHING`,
     [userId]
   );
