@@ -195,7 +195,7 @@ const findOrCreateUserAndRespond = async (
     const role = appConfig.default_role;
 
     const insertResult = await db.query(
-      `INSERT INTO "user" (phone_number, role, auth_method, first_name, last_name)
+      `INSERT INTO "user" (phone_number, registered_as, auth_method, first_name, last_name)
        VALUES ($1, $2, 'truecaller_oauth', $3, $4) RETURNING *`,
       [
         phoneNumber,
@@ -755,7 +755,7 @@ const handlers = {
     // Generate new tokens
     const user = {
       id: row.user_id,
-      role: row.role,
+      registered_as: row.registered_as,
       token_version: row.token_version,
     };
     const tokens = await generateTokens(user, appConfig);
