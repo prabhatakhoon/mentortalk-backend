@@ -236,9 +236,6 @@ const handlers = {
           aadhaar_uploaded: !!identityData.aadhaar_file_url || !!identityData.aadhaar_verified,
           aadhaar_verified: !!identityData.aadhaar_verified,
           aadhaar_file_url: identityData.aadhaar_file_url || null,
-          // BACKCOMPAT: pre-v1.0.5 mentor app reads `aadhaar_pdf_url`. Drop
-          // this alias after the force-update has rolled out.
-          aadhaar_pdf_url: identityData.aadhaar_file_url || null,
           selfie_url: selfieUrl,
           selfie_uploaded: !!identityData.selfie_url,
         },
@@ -370,22 +367,18 @@ const handlers = {
   aadhaarPresign: async (userId, body) => {
     const { file_name, content_type } = body;
     const ALLOWED_TYPES = ["application/pdf", "image/jpeg", "image/png"];
-    // BACKCOMPAT: pre-v1.0.5 mentor app omits content_type and uploads PDFs only.
-    // Default to application/pdf when absent. Drop this fallback after the
-    // force-update has rolled out and the old build is no longer in the wild.
-    const effectiveType = content_type || "application/pdf";
-    if (!ALLOWED_TYPES.includes(effectiveType)) {
+    if (!ALLOWED_TYPES.includes(content_type)) {
       return {
         statusCode: 400,
         body: { error: "Unsupported file type. Allowed: PDF, JPG, PNG." },
       };
     }
-    const safeName = file_name || (effectiveType === "application/pdf" ? "aadhaar.pdf" : "aadhaar");
+    const safeName = file_name || (content_type === "application/pdf" ? "aadhaar.pdf" : "aadhaar");
     const s3Key = `aadhaar/${userId}/${Date.now()}-${safeName}`;
     const command = new PutObjectCommand({
       Bucket: BUCKET_NAME,
       Key: s3Key,
-      ContentType: effectiveType,
+      ContentType: content_type,
     });
     const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 });
 
