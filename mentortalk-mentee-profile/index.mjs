@@ -501,22 +501,28 @@ async function photoDelete(db, userId) {
  * List of mentors this mentee has chatted with.
  * Mirror of mentor Lambda's getMentees, flipped.
  */
+// Returns mentee-side eligibility for the platform first-session promo plus the
+// flat per-minute promo rate. Per-mentor eligibility (`intro_promo_enabled`)
+// is checked separately by each caller.
 async function getMenteeIntroEligible(db, userId) {
   const { rows } = await db.query(
     `SELECT
-       COALESCE(mps.intro_session_used, TRUE) AS intro_used,
-       COALESCE(pc.intro_rate_enabled, FALSE) AS intro_enabled
+       (mps.intro_session_id IS NULL)              AS intro_unused,
+       COALESCE(pc.intro_rate_enabled, FALSE)      AS intro_enabled,
+       pc.intro_rate_per_minute                    AS intro_rate_per_minute
      FROM (SELECT 1) AS dummy
      LEFT JOIN mentee_promo_status mps ON mps.user_id = $1
      LEFT JOIN promo_config pc ON pc.id = 1`,
     [userId]
   );
-  if (rows.length === 0) return false;
-  return !rows[0].intro_used && rows[0].intro_enabled;
+  if (rows.length === 0) return { eligible: false, ratePerMinute: 0 };
+  const eligible = !!rows[0].intro_unused && !!rows[0].intro_enabled;
+  const ratePerMinute = parseFloat(rows[0].intro_rate_per_minute) || 0;
+  return { eligible, ratePerMinute };
 }
 
 async function getChats(db, userId, queryParams) {
-  const menteeIntroEligible = await getMenteeIntroEligible(db, userId);
+  const menteeIntroPromo = await getMenteeIntroEligible(db, userId);
 
   const limit = Math.min(parseInt(queryParams.limit || "20"), 50);
   const offset = parseInt(queryParams.offset || "0");
@@ -550,7 +556,8 @@ async function getChats(db, userId, queryParams) {
        mp.first_name,
        mp.last_name,
        mp.pref_audio,
-       mp.intro_discount_percent,
+       mp.chat_discount_percent,
+       mp.intro_promo_enabled,
        mp.pref_video,
       mp.profile_photo_url,
        mp.rate_per_minute,
@@ -562,7 +569,7 @@ async function getChats(db, userId, queryParams) {
      WHERE s.mentee_id = $1
        AND s.status = 'completed'
        ${blockedCondition}
-     GROUP BY s.mentor_id, mp.first_name, mp.last_name, mp.profile_photo_url, mp.pref_audio, mp.pref_video, mp.intro_discount_percent,
+     GROUP BY s.mentor_id, mp.first_name, mp.last_name, mp.profile_photo_url, mp.pref_audio, mp.pref_video, mp.chat_discount_percent, mp.intro_promo_enabled,
   mp.rate_per_minute, mp.is_available
      ORDER BY last_session_at DESC
      LIMIT $2 OFFSET $3`,
@@ -591,6 +598,7 @@ async function getChats(db, userId, queryParams) {
 
       const avatar = resolvePhotoUrl(row.profile_photo_url);
 
+      const promoEligible = menteeIntroPromo.eligible && !!row.intro_promo_enabled;
       return {
         mentor_id: row.mentor_id,
         name: [row.first_name, row.last_name].filter(Boolean).join(" ") || "Mentor",
@@ -600,11 +608,12 @@ async function getChats(db, userId, queryParams) {
         last_activity: lastActivity,
         pref_audio: row.pref_audio ?? true,
         pref_video: row.pref_video ?? true,
-        intro_rate_eligible: menteeIntroEligible && row.intro_discount_percent != null,
-        intro_discount_percent: row.intro_discount_percent,
-        intro_rate_per_minute: (menteeIntroEligible && row.intro_discount_percent != null)
-          ? parseFloat(row.rate_per_minute) * (1 - row.intro_discount_percent / 100)
+        chat_discount_percent: row.chat_discount_percent,
+        discounted_rate_per_minute: row.chat_discount_percent != null
+          ? parseFloat(row.rate_per_minute) * (1 - row.chat_discount_percent / 100)
           : null,
+        intro_promo_eligible: promoEligible,
+        intro_promo_rate_per_minute: promoEligible ? menteeIntroPromo.ratePerMinute : null,
         rate_per_minute: parseFloat(row.rate_per_minute) || 0,
         is_available: row.is_available ?? false,
         presence: (row.is_available && presenceResult.Item?.status === "online") ? "online" : (presenceResult.Item?.status ===
