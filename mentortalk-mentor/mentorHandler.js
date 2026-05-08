@@ -364,7 +364,7 @@ async function getProfile(userId) {
        u.created_at AS member_since,
        mp.profile_photo_url, mp.bio, mp.rate_per_minute,
        mp.is_available, mp.pref_audio, mp.pref_video,
-       mp.intro_discount_percent,
+       mp.chat_discount_percent,
        mp.rules_acknowledged_at,
        mw.balance AS wallet_balance, mp.avg_rating, mp.total_reviews,
        mp.unlocked_tier_id,
@@ -420,9 +420,16 @@ LEFT JOIN user_language ul ON ul.user_id = u.id AND ul.role = 'mentor'
     video_rate_per_minute: row.rate_per_minute
       ? parseFloat(row.rate_per_minute) * VIDEO_RATE_MULTIPLIER
       : null,
-    intro_discount_percent: row.intro_discount_percent,
-    intro_rate_per_minute: row.intro_discount_percent != null
-      ? parseFloat(row.rate_per_minute) * (1 - row.intro_discount_percent / 100)
+    chat_discount_percent: row.chat_discount_percent,
+    discounted_rate_per_minute: row.chat_discount_percent != null
+      ? parseFloat(row.rate_per_minute) * (1 - row.chat_discount_percent / 100)
+      : null,
+    // BACKCOMPAT: pre-v<X> mentor app reads `intro_discount_percent` and
+    // `intro_rate_per_minute`. Drop these aliases after the force-update has
+    // rolled out.
+    intro_discount_percent: row.chat_discount_percent,
+    intro_rate_per_minute: row.chat_discount_percent != null
+      ? parseFloat(row.rate_per_minute) * (1 - row.chat_discount_percent / 100)
       : null,
     rules_acknowledged_at: row.rules_acknowledged_at,
     is_available: row.is_available,
@@ -499,13 +506,19 @@ async function updateProfile(userId, event) {
     profileUpdates.push(`rate_per_minute = $${pidx++}`);
     profileValues.push(body.rate_per_minute);
   }
-  if (body.intro_discount_percent !== undefined) {
+  // BACKCOMPAT: pre-v<X> mentor app sends `intro_discount_percent`.
+  // Treat it as an alias for the new `chat_discount_percent`. Drop the alias
+  // branch after the force-update has rolled out.
+  const chatDiscountValue = body.chat_discount_percent !== undefined
+    ? body.chat_discount_percent
+    : body.intro_discount_percent;
+  if (chatDiscountValue !== undefined) {
     const valid = [null, 25, 50];
-    if (!valid.includes(body.intro_discount_percent)) {
-      return respond(400, { error: "intro_discount_percent must be null, 25, or 50" });
+    if (!valid.includes(chatDiscountValue)) {
+      return respond(400, { error: "chat_discount_percent must be null, 25, or 50" });
     }
-    profileUpdates.push(`intro_discount_percent = $${pidx++}`);
-    profileValues.push(body.intro_discount_percent);
+    profileUpdates.push(`chat_discount_percent = $${pidx++}`);
+    profileValues.push(chatDiscountValue);
   }
 
   // ── Languages (ISO 639-1 codes via user_language junction table) ──
