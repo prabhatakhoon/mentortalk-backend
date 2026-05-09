@@ -861,6 +861,20 @@ async function getReviews(db, userId, queryParams) {
   const limit = Math.min(parseInt(queryParams.limit || "15"), 50);
   const offset = parseInt(queryParams.offset || "0");
 
+  // Whitelist sort values; tie-break on created_at DESC for stable pagination.
+  let orderBy;
+  switch (queryParams.sort) {
+    case "rating_high_low":
+      orderBy = "ORDER BY r.rating DESC, r.created_at DESC";
+      break;
+    case "rating_low_high":
+      orderBy = "ORDER BY r.rating ASC, r.created_at DESC";
+      break;
+    case "newest":
+    default:
+      orderBy = "ORDER BY r.created_at DESC";
+  }
+
   // LEFT JOIN session/mentor_profile so the list always returns the same row
   // count as the COUNT(*) below — INNER joins were silently dropping reviews
   // whose session/mentor_profile rows had been deleted (mentor account
@@ -881,7 +895,7 @@ async function getReviews(db, userId, queryParams) {
      LEFT JOIN session s ON s.id = r.session_id
      LEFT JOIN mentor_profile mp ON mp.user_id = r.mentor_id
      WHERE r.mentee_id = $1
-     ORDER BY r.created_at DESC
+     ${orderBy}
      LIMIT $2 OFFSET $3`,
     [userId, limit, offset]
   );
