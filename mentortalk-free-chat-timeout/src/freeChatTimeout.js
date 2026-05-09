@@ -127,7 +127,7 @@ export const handler = async (event) => {
 
   // 1. Check session is still in 'requested' state and is a free chat
   const sessionResult = await db.query(
-    `SELECT id, mentor_id, mentee_id, status, billing_type
+    `SELECT id, mentor_id, mentee_id, status, billing_type, is_test
      FROM session WHERE id = $1`,
     [sessionId],
   );
@@ -173,6 +173,19 @@ export const handler = async (event) => {
 
   const remainingMentors = queue?.remaining_mentors || [];
 
+  // Realm re-check: queue was seeded by sessionHandler.handleFreeChat from a
+  // realm-filtered candidate query, but a stale queue (admin tooling, realm
+  // flip after seeding) could surface a wrong-realm mentor. Defense in depth
+  // — fetch the eligible-realm subset up front and skip anything not in it.
+  let realmEligible = new Set();
+  if (remainingMentors.length > 0) {
+    const realmCheck = await db.query(
+      `SELECT id FROM "user" WHERE id = ANY($1) AND is_test_account = $2`,
+      [remainingMentors, session.is_test],
+    );
+    realmEligible = new Set(realmCheck.rows.map((r) => r.id));
+  }
+
   // 4. Find next eligible online mentor
   let nextMentor = null;
   const stillRemaining = [];
@@ -184,6 +197,10 @@ export const handler = async (event) => {
       // Already found one — keep the rest for future forwards
       stillRemaining.push(mentorId);
       continue;
+    }
+
+    if (!realmEligible.has(mentorId)) {
+      continue; // wrong realm — skip
     }
 
     // Check presence
