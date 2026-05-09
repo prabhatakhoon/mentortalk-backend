@@ -1592,9 +1592,16 @@ const handlers = {
     const isBank = type === "bank";
     const rejectionPredicate =
       state === "action_required" ? "IS NOT NULL" : "IS NULL";
-    const filter = isBank
+    const baseFilter = isBank
       ? `mpa.account_number IS NOT NULL AND mpa.bank_verified = FALSE AND mpa.bank_rejection_reason ${rejectionPredicate}`
       : `mpa.pan_number IS NOT NULL AND mpa.pan_verified = FALSE AND mpa.pan_rejection_reason ${rejectionPredicate}`;
+    // Hard test/prod switch: test_mode=true returns ONLY test mentor rows;
+    // default returns ONLY prod rows. Never mixed (mirrors panel cookie).
+    const testMode = queryParams.test_mode === "true";
+    const testFilter = testMode
+      ? ` AND EXISTS (SELECT 1 FROM "user" tu WHERE tu.id = mpa.user_id AND tu.is_test_account)`
+      : ` AND NOT EXISTS (SELECT 1 FROM "user" tu WHERE tu.id = mpa.user_id AND tu.is_test_account)`;
+    const filter = baseFilter + testFilter;
     const orderCol = isBank ? "mpa.bank_submitted_at" : "mpa.pan_submitted_at";
 
     const totalQ = await db.query(
@@ -1606,6 +1613,7 @@ const handlers = {
       `SELECT
          u.id AS user_id,
          u.phone_number,
+         u.is_test_account,
          NULLIF(TRIM(CONCAT(mp.first_name, ' ', mp.last_name)), '') AS mentor_name,
          iv.aadhaar_verified,
          iv.selfie_url AS selfie_key,
@@ -1648,6 +1656,7 @@ const handlers = {
           user_id: r.user_id,
           mentor_name: r.mentor_name,
           mentor_phone: r.phone_number,
+          is_test_account: r.is_test_account || false,
           aadhaar_verified: r.aadhaar_verified || false,
           selfie_url: await presignS3(r.selfie_key, 3600),
           submitted_at: isBank ? r.bank_submitted_at : r.pan_submitted_at,
@@ -2799,6 +2808,10 @@ const handlers = {
   photosPendingProfile: async (queryParams) => {
     const limit = Math.min(parseInt(queryParams.limit) || 50, 200);
     const offset = parseInt(queryParams.offset) || 0;
+    // Hard test/prod switch (mirrors payoutsVerificationsPending). test_mode=true
+    // returns ONLY test-account rows; default returns ONLY prod. Never mixed.
+    const testMode = queryParams.test_mode === "true";
+    const testFilter = testMode ? "AND u.is_test_account" : "AND NOT u.is_test_account";
     const db = await getPool();
 
     const totalRes = await db.query(
@@ -2806,7 +2819,7 @@ const handlers = {
          FROM mentor_profile mp
          JOIN "user" u ON u.id = mp.user_id
          WHERE mp.pending_profile_photo_status IS NOT NULL
-           AND NOT u.is_test_account`,
+           ${testFilter}`,
     );
     const total = totalRes.rows[0].total;
 
@@ -2821,7 +2834,7 @@ const handlers = {
          FROM mentor_profile mp
          JOIN "user" u ON u.id = mp.user_id
          WHERE mp.pending_profile_photo_status IS NOT NULL
-           AND NOT u.is_test_account
+           ${testFilter}
          ORDER BY
            CASE WHEN mp.pending_profile_photo_status = 'under_review' THEN 0 ELSE 1 END,
            mp.updated_at ASC
@@ -2864,6 +2877,8 @@ const handlers = {
   photosPendingMentorPhotos: async (queryParams) => {
     const limit = Math.min(parseInt(queryParams.limit) || 50, 200);
     const offset = parseInt(queryParams.offset) || 0;
+    const testMode = queryParams.test_mode === "true";
+    const testFilter = testMode ? "AND u.is_test_account" : "AND NOT u.is_test_account";
     const db = await getPool();
 
     const totalRes = await db.query(
@@ -2871,7 +2886,7 @@ const handlers = {
          FROM mentor_photo mph
          JOIN "user" u ON u.id = mph.user_id
          WHERE mph.status = 'under_review'
-           AND NOT u.is_test_account`,
+           ${testFilter}`,
     );
     const total = totalRes.rows[0].total;
 
@@ -2896,7 +2911,7 @@ const handlers = {
          FROM pending p
          JOIN mentor_profile mp ON mp.user_id = p.user_id
          JOIN "user" u ON u.id = p.user_id
-         WHERE NOT u.is_test_account
+         WHERE 1=1 ${testFilter}
          ORDER BY p.oldest_pending_at ASC
          LIMIT $1 OFFSET $2`,
       [limit, offset],
