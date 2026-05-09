@@ -395,7 +395,7 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
        FROM mentor_profile mp2
        JOIN "user" u ON u.id = mp2.user_id
        WHERE u.account_status = 'active'
-         AND u.phone_number != '+910000000000'
+         AND NOT u.is_test_account
          AND EXISTS (SELECT 1 FROM mentorship_application ma WHERE ma.user_id = mp2.user_id AND ma.submission_status = 'approved')
          ${catIds ? `AND EXISTS (SELECT 1 FROM user_mentorship um WHERE um.user_id = mp2.user_id AND um.role = 'mentor' AND um.mentorship_category_id IN (SELECT cat_id FROM mentee_cats))` : ''}
          ${blockedCondition}
@@ -538,7 +538,7 @@ async function searchMentors(db, queryParams, blockedIds = [], menteeIntroPromo 
   // Build dynamic query parts
   const conditions = [
     `u.account_status = 'active'`,
-    `u.phone_number != '+910000000000'`,
+    `NOT u.is_test_account`,
     `EXISTS (SELECT 1 FROM mentorship_application ma WHERE ma.user_id = u.id AND ma.submission_status = 'approved')`,
   ];
   const joins = [`JOIN mentor_profile mp ON mp.user_id = u.id`];
@@ -1012,7 +1012,7 @@ async function getFollowing(db, userId, queryParams, menteeIntroPromo = { eligib
      JOIN mentor_profile mp ON mp.user_id = f.mentor_id
     WHERE f.mentee_id = $1
        AND u.account_status = 'active'
-       AND u.phone_number != '+910000000000'
+       AND NOT u.is_test_account
      ORDER BY f.created_at DESC
      LIMIT $2 OFFSET $3`,
     [userId, limit, offset]
