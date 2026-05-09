@@ -271,22 +271,32 @@ if (duplicate.rows.length > 0) {
 try {
   await db.query("BEGIN");
 
+  // Look up the mentee's is_test_account so both halves of the double-entry
+  // pair carry the same flag. Real top-ups will set is_test = FALSE; test
+  // mentee top-ups (only path: admin manual seed via /admin endpoint) get
+  // is_test = TRUE so they don't pollute platform_cash totals.
+  const userFlagResult = await db.query(
+    `SELECT is_test_account FROM "user" WHERE id = $1`,
+    [userId]
+  );
+  const isTest = !!userFlagResult.rows[0]?.is_test_account;
+
   // Insert mentee credit transaction (linked to mentee wallet)
   await db.query(
-    `INSERT INTO transaction (id, wallet_id, user_id, type, direction, amount, reference_id, status)
+    `INSERT INTO transaction (id, wallet_id, user_id, type, direction, amount, reference_id, status, is_test)
      VALUES (
        gen_random_uuid(),
        (SELECT id FROM wallet WHERE user_id = $1 AND type = 'mentee'),
-       $1, 'wallet_topup', 'credit', $2, $3, 'completed'
+       $1, 'wallet_topup', 'credit', $2, $3, 'completed', $4
      )`,
-    [userId, parsedAmount, razorpay_payment_id]
+    [userId, parsedAmount, razorpay_payment_id, isTest]
   );
 
   // Insert platform debit transaction (double-entry)
   await db.query(
-    `INSERT INTO transaction (id, user_id, type, direction, amount, reference_id, status)
-     VALUES (gen_random_uuid(), '00000000-0000-0000-0000-000000000000', 'platform_cash', 'debit', $1, $2, 'completed')`,
-    [parsedAmount, razorpay_payment_id]
+    `INSERT INTO transaction (id, user_id, type, direction, amount, reference_id, status, is_test)
+     VALUES (gen_random_uuid(), '00000000-0000-0000-0000-000000000000', 'platform_cash', 'debit', $1, $2, 'completed', $3)`,
+    [parsedAmount, razorpay_payment_id, isTest]
   );
 
   // Update wallet balance
