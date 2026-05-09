@@ -2113,9 +2113,12 @@ const handlers = {
       await client.query("BEGIN");
 
       const payoutRes = await client.query(
-        `SELECT id, mentor_id, wallet_id, gross_amount, status,
-                bank_name, bank_account_number_masked
-         FROM payout WHERE id = $1 FOR UPDATE`,
+        `SELECT p.id, p.mentor_id, p.wallet_id, p.gross_amount, p.status,
+                p.bank_name, p.bank_account_number_masked,
+                u.is_test_account
+         FROM payout p
+         JOIN "user" u ON u.id = p.mentor_id
+         WHERE p.id = $1 FOR UPDATE OF p`,
         [payoutId],
       );
       if (payoutRes.rows.length === 0) {
@@ -2149,20 +2152,22 @@ const handlers = {
       );
 
       await client.query(
-        `INSERT INTO transaction (user_id, wallet_id, type, direction, amount, reference_id, status, notes)
-         VALUES ($1, $2, 'payout', 'debit', $3, $4, 'completed', $5)`,
+        `INSERT INTO transaction (user_id, wallet_id, type, direction, amount, reference_id, status, notes, is_test)
+         VALUES ($1, $2, 'payout', 'debit', $3, $4, 'completed', $5, $6)`,
         [
           payout.mentor_id,
           payout.wallet_id,
           payout.gross_amount,
           payoutId,
           txnNotes,
+          payout.is_test_account,
         ],
       );
 
       // Platform-side credit (double-entry): cash leaves platform_cash to settle the mentor liability.
+      // Inherits is_test from the payout's mentor (paired entry of the double-entry).
       await client.query(
-        `INSERT INTO transaction (user_id, type, direction, amount, reference_id, status, notes)
+        `INSERT INTO transaction (user_id, type, direction, amount, reference_id, status, notes, is_test)
          VALUES (
            '00000000-0000-0000-0000-000000000000',
            'platform_payout',
@@ -2170,9 +2175,10 @@ const handlers = {
            $1,
            $2,
            'completed',
-           $3
+           $3,
+           $4
          )`,
-        [payout.gross_amount, payoutId, txnNotes],
+        [payout.gross_amount, payoutId, txnNotes, payout.is_test_account],
       );
       // TODO: when TDS activates, also insert tds_deduction (mentor debit) + tds_payable (platform credit)
 
@@ -2479,6 +2485,7 @@ const handlers = {
         JOIN wallet w ON w.user_id = u.id AND w.type = 'mentor'
         JOIN mentor_payout_account mpa ON mpa.user_id = u.id
         WHERE u.account_status = 'active'
+          AND NOT u.is_test_account
       `;
 
       const [
@@ -2552,6 +2559,7 @@ const handlers = {
              AND mpa.pan_verified = TRUE
              AND mpa.bank_verified_at < NOW() - INTERVAL '48 hours'
              AND u.account_status = 'active'
+             AND NOT u.is_test_account
              AND NOT EXISTS (
                SELECT 1 FROM payout p
                WHERE p.mentor_id = u.id
@@ -2794,8 +2802,11 @@ const handlers = {
     const db = await getPool();
 
     const totalRes = await db.query(
-      `SELECT COUNT(*)::int AS total FROM mentor_profile
-       WHERE pending_profile_photo_status IS NOT NULL`,
+      `SELECT COUNT(*)::int AS total
+         FROM mentor_profile mp
+         JOIN "user" u ON u.id = mp.user_id
+         WHERE mp.pending_profile_photo_status IS NOT NULL
+           AND NOT u.is_test_account`,
     );
     const total = totalRes.rows[0].total;
 
@@ -2808,7 +2819,9 @@ const handlers = {
               mp.pending_profile_photo_reviewed_at,
               mp.updated_at
          FROM mentor_profile mp
+         JOIN "user" u ON u.id = mp.user_id
          WHERE mp.pending_profile_photo_status IS NOT NULL
+           AND NOT u.is_test_account
          ORDER BY
            CASE WHEN mp.pending_profile_photo_status = 'under_review' THEN 0 ELSE 1 END,
            mp.updated_at ASC
@@ -2854,8 +2867,11 @@ const handlers = {
     const db = await getPool();
 
     const totalRes = await db.query(
-      `SELECT COUNT(DISTINCT user_id)::int AS total
-         FROM mentor_photo WHERE status = 'under_review'`,
+      `SELECT COUNT(DISTINCT mph.user_id)::int AS total
+         FROM mentor_photo mph
+         JOIN "user" u ON u.id = mph.user_id
+         WHERE mph.status = 'under_review'
+           AND NOT u.is_test_account`,
     );
     const total = totalRes.rows[0].total;
 
@@ -2879,6 +2895,8 @@ const handlers = {
               mp.first_name, mp.last_name, mp.profile_photo_url
          FROM pending p
          JOIN mentor_profile mp ON mp.user_id = p.user_id
+         JOIN "user" u ON u.id = p.user_id
+         WHERE NOT u.is_test_account
          ORDER BY p.oldest_pending_at ASC
          LIMIT $1 OFFSET $2`,
       [limit, offset],
