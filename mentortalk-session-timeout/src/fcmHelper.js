@@ -122,11 +122,22 @@ async function getPool() {
  * @param {object} [options.data] - Optional data payload (all values must be strings)
  * @returns {boolean} - true if sent, false if user has no FCM token
  */
-export async function sendFcmNotification(userId, { title, body, data = {} }) {
+export async function sendFcmNotification(userId, { title, body, data = {} }, opts = {}) {
+  // Per-app FCM column. When opts.app is "mentor"/"mentee" we read the
+  // per-app token; if omitted (legacy callers during the v016 rollout) we
+  // fall back to the legacy fcm_token column. The auth lambda dual-writes
+  // both during the rollout window so either path works.
+  const fcmColumn =
+    opts.app === "mentor"
+      ? "mentor_fcm_token"
+      : opts.app === "mentee"
+        ? "mentee_fcm_token"
+        : "fcm_token";
+
   // Look up FCM token from DB
   const db = await getPool();
   const result = await db.query(
-    `SELECT fcm_token FROM "user" WHERE id = $1`,
+    `SELECT ${fcmColumn} AS fcm_token FROM "user" WHERE id = $1`,
     [userId]
   );
 
@@ -196,7 +207,7 @@ export async function sendFcmNotification(userId, { title, body, data = {} }) {
       // If token is invalid, clear it from DB
       if (error.includes("UNREGISTERED") || error.includes("INVALID_ARGUMENT")) {
         await db.query(
-          `UPDATE "user" SET fcm_token = NULL WHERE id = $1`,
+          `UPDATE "user" SET ${fcmColumn} = NULL WHERE id = $1`,
           [userId]
         );
         console.log(`Cleared invalid FCM token for user ${userId}`);
