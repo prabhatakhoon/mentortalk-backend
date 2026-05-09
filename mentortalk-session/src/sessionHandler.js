@@ -558,7 +558,7 @@ async function handleSessionRequest(menteeId, event) {
 
   // 1. Check mentor exists, is approved, and is active
   const mentorResult = await db.query(
-    `SELECT u.id, mp.first_name, mp.last_name,
+    `SELECT u.id, u.is_test_account, mp.first_name, mp.last_name,
             mp.rate_per_minute, mp.profile_photo_url,
             mp.is_available, mp.pref_audio, mp.pref_video,
             mp.chat_discount_percent, mp.intro_promo_enabled
@@ -678,13 +678,28 @@ async function handleSessionRequest(menteeId, event) {
 
   const mentorIsOnline = presence.Item?.status === "online";
 
-  // 7. Get mentee info
+  // 7. Get mentee info (incl. is_test_account so the session can be tagged)
   const menteeResult = await db.query(
-    `SELECT first_name, last_name FROM mentee_profile WHERE user_id = $1`,
+    `SELECT mp.first_name, mp.last_name, u.is_test_account
+     FROM mentee_profile mp
+     JOIN "user" u ON u.id = mp.user_id
+     WHERE mp.user_id = $1`,
     [menteeId]
   );
   const mentee = menteeResult.rows[0];
   const menteeName = [mentee?.first_name, mentee?.last_name].filter(Boolean).join(' ') || 'Mentee';
+
+  // Hard-block cross-realm bookings: test accounts can only interact with
+  // other test accounts. Prevents a real mentor's earnings/session-count
+  // from being inflated by a test mentee, and avoids real mentees being
+  // billed for test-mentor sessions. Mirrors Uber's "test riders match only
+  // with test drivers" rule.
+  if (!!mentor.is_test_account !== !!mentee?.is_test_account) {
+    return respond(403, {
+      error: "Test accounts can only book other test accounts",
+    });
+  }
+  const isTestSession = !!(mentor.is_test_account || mentee?.is_test_account);
 
   // 8. Create session
   let sessionStatus;
@@ -695,10 +710,10 @@ async function handleSessionRequest(menteeId, event) {
   }
 
   const sessionResult = await db.query(
-    `INSERT INTO session (mentee_id, mentor_id, status, requested_session_type, billing_type, started_at)
-     VALUES ($1, $2, $3, $4, $5, NOW())
-     RETURNING id, status, started_at`,
-    [menteeId, mentor_id, sessionStatus, session_type, billingType]
+    `INSERT INTO session (mentee_id, mentor_id, status, requested_session_type, billing_type, started_at, is_test)
+     VALUES ($1, $2, $3, $4, $5, NOW(), $6)
+     RETURNING id, status, started_at, is_test`,
+    [menteeId, mentor_id, sessionStatus, session_type, billingType, isTestSession]
   );
 
   const session = sessionResult.rows[0];
@@ -1451,29 +1466,29 @@ async function handleSessionEnd(userId, event) {
 
     if (grossAmount > 0) {
       await client.query(
-        `INSERT INTO transaction (wallet_id, user_id, type, direction, amount, session_id, status)
+        `INSERT INTO transaction (wallet_id, user_id, type, direction, amount, session_id, status, is_test)
          VALUES (
            (SELECT id FROM wallet WHERE user_id = $1 AND type = 'mentee'),
-           $1, 'session_payment', 'debit', $2, $3, 'completed'
+           $1, 'session_payment', 'debit', $2, $3, 'completed', $4
          )`,
-        [session.mentee_id, grossAmount, sessionId]
+        [session.mentee_id, grossAmount, sessionId, session.is_test]
       );
 
       // Write session_earning even when amount is 0 (1-min paid sessions)
       await client.query(
-        `INSERT INTO transaction (wallet_id, user_id, type, direction, amount, session_id, status)
+        `INSERT INTO transaction (wallet_id, user_id, type, direction, amount, session_id, status, is_test)
          VALUES (
            (SELECT id FROM wallet WHERE user_id = $1 AND type = 'mentor'),
-           $1, 'session_earning', 'credit', $2, $3, 'completed'
+           $1, 'session_earning', 'credit', $2, $3, 'completed', $4
          )`,
-        [session.mentor_id, mentorEarning, sessionId]
+        [session.mentor_id, mentorEarning, sessionId, session.is_test]
       );
 
       const PLATFORM_USER_ID = "00000000-0000-0000-0000-000000000000";
       await client.query(
-        `INSERT INTO transaction (user_id, type, direction, amount, session_id, status)
-         VALUES ($1, 'platform_fee', 'credit', $2, $3, 'completed')`,
-        [PLATFORM_USER_ID, platformFee, sessionId]
+        `INSERT INTO transaction (user_id, type, direction, amount, session_id, status, is_test)
+         VALUES ($1, 'platform_fee', 'credit', $2, $3, 'completed', $4)`,
+        [PLATFORM_USER_ID, platformFee, sessionId, session.is_test]
       );
     }
   // Log free chat in transaction history (zero amount, same types as paid)
@@ -1481,27 +1496,27 @@ async function handleSessionEnd(userId, event) {
     const PLATFORM_USER_ID_FC = "00000000-0000-0000-0000-000000000000";
 
     await client.query(
-      `INSERT INTO transaction (wallet_id, user_id, type, direction, amount, session_id, status)
+      `INSERT INTO transaction (wallet_id, user_id, type, direction, amount, session_id, status, is_test)
        VALUES (
          (SELECT id FROM wallet WHERE user_id = $1 AND type = 'mentee'),
-         $1, 'session_payment', 'debit', 0, $2, 'completed'
+         $1, 'session_payment', 'debit', 0, $2, 'completed', $3
        )`,
-      [session.mentee_id, sessionId]
+      [session.mentee_id, sessionId, session.is_test]
     );
 
     await client.query(
-      `INSERT INTO transaction (wallet_id, user_id, type, direction, amount, session_id, status)
+      `INSERT INTO transaction (wallet_id, user_id, type, direction, amount, session_id, status, is_test)
        VALUES (
          (SELECT id FROM wallet WHERE user_id = $1 AND type = 'mentor'),
-         $1, 'session_earning', 'credit', 0, $2, 'completed'
+         $1, 'session_earning', 'credit', 0, $2, 'completed', $3
        )`,
-      [session.mentor_id, sessionId]
+      [session.mentor_id, sessionId, session.is_test]
     );
 
     await client.query(
-      `INSERT INTO transaction (user_id, type, direction, amount, session_id, status)
-       VALUES ($1, 'platform_fee', 'credit', 0, $2, 'completed')`,
-      [PLATFORM_USER_ID_FC, sessionId]
+      `INSERT INTO transaction (user_id, type, direction, amount, session_id, status, is_test)
+       VALUES ($1, 'platform_fee', 'credit', 0, $2, 'completed', $3)`,
+      [PLATFORM_USER_ID_FC, sessionId, session.is_test]
     );
   }
 
@@ -1826,7 +1841,8 @@ async function handleFreeChat(menteeId, event) {
     });
   }
 
-  // 4. Get mentee's categories for matching
+  // 4. Get mentee's categories for matching, plus the mentee's is_test_account
+  //    (used below to confine candidate matching to the same realm).
   const menteeCategories = await db.query(
     `SELECT mentorship_category_id FROM user_mentorship WHERE user_id = $1 AND role = 'mentee'`,
     [menteeId]
@@ -1837,9 +1853,19 @@ async function handleFreeChat(menteeId, event) {
     return respond(400, { error: "No mentorship categories selected" });
   }
 
-  // 5. Find eligible mentors: online, available, free_chat_enabled, quota not exhausted, category overlap
+  const menteeFlagResult = await db.query(
+    `SELECT is_test_account FROM "user" WHERE id = $1`,
+    [menteeId]
+  );
+  const menteeIsTest = !!menteeFlagResult.rows[0]?.is_test_account;
+
+  // 5. Find eligible mentors: online, available, free_chat_enabled, quota
+  //    not exhausted, category overlap, AND same realm as the mentee
+  //    (test mentees only match test mentors and vice versa — mirrors the
+  //    cross-realm block in handleSessionRequest).
   const mentorCandidates = await db.query(
     `SELECT mp.user_id, mp.first_name, mp.last_name, mp.profile_photo_url,
+       u.is_test_account,
        COALESCE(q.count, 0) AS free_chat_count
      FROM mentor_profile mp
      JOIN "user" u ON u.id = mp.user_id
@@ -1850,6 +1876,7 @@ async function handleFreeChat(menteeId, event) {
        AND ma.submission_status = 'approved'
        AND mp.is_available = TRUE
        AND mp.free_chat_enabled = TRUE
+       AND u.is_test_account = $4
        AND EXISTS (
          SELECT 1 FROM user_mentorship um
          WHERE um.user_id = mp.user_id
@@ -1864,7 +1891,7 @@ async function handleFreeChat(menteeId, event) {
        AND mp.user_id != $3
      ORDER BY free_chat_count ASC, RANDOM()
      LIMIT 5`,
-      [menteeCategoryIds, cfg.mentor_daily_free_cap, menteeId]
+      [menteeCategoryIds, cfg.mentor_daily_free_cap, menteeId, menteeIsTest]
   );
 
   if (mentorCandidates.rows.length === 0) {
@@ -1898,13 +1925,17 @@ async function handleFreeChat(menteeId, event) {
     });
   }
 
-  // 7. Create session with billing_type = 'free_intro'
+  // 7. Create session with billing_type = 'free_intro'. Realm match was
+  //    enforced at the candidates SELECT above (u.is_test_account = $4),
+  //    so selectedMentor.is_test_account == menteeIsTest by construction.
+  const isTestSession = menteeIsTest;
+
   const sessionResult = await db.query(
     `INSERT INTO session
-       (mentee_id, mentor_id, status, requested_session_type, billing_type, started_at)
-     VALUES ($1, $2, 'requested', 'chat', 'free_intro', NOW())
-     RETURNING id, status`,
-    [menteeId, selectedMentor.user_id]
+       (mentee_id, mentor_id, status, requested_session_type, billing_type, started_at, is_test)
+     VALUES ($1, $2, 'requested', 'chat', 'free_intro', NOW(), $3)
+     RETURNING id, status, is_test`,
+    [menteeId, selectedMentor.user_id, isTestSession]
   );
   const sessionId = sessionResult.rows[0].id;
 
