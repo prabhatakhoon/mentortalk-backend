@@ -174,29 +174,29 @@ export const handler = async (event) => {
     // Create transactions
     if (grossAmount > 0) {
       await client.query(
-        `INSERT INTO transaction (wallet_id, user_id, type, direction, amount, session_id, status)
+        `INSERT INTO transaction (wallet_id, user_id, type, direction, amount, session_id, status, is_test)
          VALUES (
            (SELECT id FROM wallet WHERE user_id = $1 AND type = 'mentee'),
-           $1, 'session_payment', 'debit', $2, $3, 'completed'
+           $1, 'session_payment', 'debit', $2, $3, 'completed', $4
          )`,
-        [session.mentee_id, grossAmount, sessionId]
+        [session.mentee_id, grossAmount, sessionId, session.is_test]
       );
 
       // Write session_earning even when amount is 0 (1-min paid sessions)
       await client.query(
-        `INSERT INTO transaction (wallet_id, user_id, type, direction, amount, session_id, status)
+        `INSERT INTO transaction (wallet_id, user_id, type, direction, amount, session_id, status, is_test)
          VALUES (
            (SELECT id FROM wallet WHERE user_id = $1 AND type = 'mentor'),
-           $1, 'session_earning', 'credit', $2, $3, 'completed'
+           $1, 'session_earning', 'credit', $2, $3, 'completed', $4
          )`,
-        [session.mentor_id, mentorEarning, sessionId]
+        [session.mentor_id, mentorEarning, sessionId, session.is_test]
       );
 
       const PLATFORM_USER_ID = "00000000-0000-0000-0000-000000000000";
       await client.query(
-        `INSERT INTO transaction (user_id, type, direction, amount, session_id, status)
-         VALUES ($1, 'platform_fee', 'credit', $2, $3, 'completed')`,
-        [PLATFORM_USER_ID, platformFee, sessionId]
+        `INSERT INTO transaction (user_id, type, direction, amount, session_id, status, is_test)
+         VALUES ($1, 'platform_fee', 'credit', $2, $3, 'completed', $4)`,
+        [PLATFORM_USER_ID, platformFee, sessionId, session.is_test]
       );
     }
 
