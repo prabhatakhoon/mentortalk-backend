@@ -2816,19 +2816,26 @@ const handlers = {
       [limit, offset],
     );
 
+    // Photo URLs are presigned (1h TTL) — same pattern as selfie/Aadhaar in
+    // getFiles. Avoids exposing raw CDN URLs for moderation content. See
+    // i12_photo_moderation.md §3 (security model).
+    const items = await Promise.all(
+      rows.rows.map(async (r) => ({
+        user_id: r.user_id,
+        name: [r.first_name, r.last_name].filter(Boolean).join(" "),
+        live_photo_url: await presignS3(r.live_photo_url),
+        pending_photo_url: await presignS3(r.pending_profile_photo_url),
+        status: r.pending_profile_photo_status,
+        rejection_reason: r.pending_profile_photo_rejection_reason,
+        reviewed_at: r.pending_profile_photo_reviewed_at,
+        submitted_at: r.updated_at,
+      })),
+    );
+
     return {
       statusCode: 200,
       body: {
-        items: rows.rows.map((r) => ({
-          user_id: r.user_id,
-          name: [r.first_name, r.last_name].filter(Boolean).join(" "),
-          live_photo_url: r.live_photo_url,
-          pending_photo_url: r.pending_profile_photo_url,
-          status: r.pending_profile_photo_status,
-          rejection_reason: r.pending_profile_photo_rejection_reason,
-          reviewed_at: r.pending_profile_photo_reviewed_at,
-          submitted_at: r.updated_at,
-        })),
+        items,
         total,
         has_more: offset + limit < total,
       },
@@ -2877,17 +2884,26 @@ const handlers = {
       [limit, offset],
     );
 
+    const items = await Promise.all(
+      rows.rows.map(async (r) => ({
+        user_id: r.user_id,
+        name: [r.first_name, r.last_name].filter(Boolean).join(" "),
+        avatar_url: await presignS3(r.profile_photo_url),
+        pending_count: parseInt(r.pending_count),
+        oldest_pending_at: r.oldest_pending_at,
+        pending_photos: await Promise.all(
+          (r.pending_photos || []).map(async (p) => ({
+            ...p,
+            photo_url: await presignS3(p.photo_url),
+          })),
+        ),
+      })),
+    );
+
     return {
       statusCode: 200,
       body: {
-        items: rows.rows.map((r) => ({
-          user_id: r.user_id,
-          name: [r.first_name, r.last_name].filter(Boolean).join(" "),
-          avatar_url: r.profile_photo_url,
-          pending_count: parseInt(r.pending_count),
-          oldest_pending_at: r.oldest_pending_at,
-          pending_photos: r.pending_photos || [],
-        })),
+        items,
         total,
         has_more: offset + limit < total,
       },
@@ -2948,6 +2964,23 @@ const handlers = {
       [mentorId],
     );
 
+    const [liveUrl, pendingUrl, mentorPhotos] = await Promise.all([
+      presignS3(p.profile_photo_url),
+      presignS3(p.pending_profile_photo_url),
+      Promise.all(
+        photos.rows.map(async (r) => ({
+          id: r.id,
+          photo_url: await presignS3(r.photo_url),
+          sort_order: r.sort_order,
+          status: r.status,
+          rejection_reason: r.rejection_reason,
+          reviewed_at: r.reviewed_at,
+          reviewed_by: r.reviewed_by,
+          created_at: r.created_at,
+        })),
+      ),
+    ]);
+
     return {
       statusCode: 200,
       body: {
@@ -2956,10 +2989,10 @@ const handlers = {
           name: [p.first_name, p.last_name].filter(Boolean).join(" "),
         },
         profile_photo: {
-          live_url: p.profile_photo_url,
+          live_url: liveUrl,
           pending: p.pending_profile_photo_url
             ? {
-                url: p.pending_profile_photo_url,
+                url: pendingUrl,
                 status: p.pending_profile_photo_status,
                 rejection_reason: p.pending_profile_photo_rejection_reason,
                 reviewed_at: p.pending_profile_photo_reviewed_at,
@@ -2967,16 +3000,7 @@ const handlers = {
               }
             : null,
         },
-        mentor_photos: photos.rows.map((r) => ({
-          id: r.id,
-          photo_url: r.photo_url,
-          sort_order: r.sort_order,
-          status: r.status,
-          rejection_reason: r.rejection_reason,
-          reviewed_at: r.reviewed_at,
-          reviewed_by: r.reviewed_by,
-          created_at: r.created_at,
-        })),
+        mentor_photos: mentorPhotos,
         history: history.rows,
       },
     };
