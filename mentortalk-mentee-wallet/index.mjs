@@ -286,7 +286,7 @@ try {
   await db.query(
     `INSERT INTO transaction (id, user_id, type, direction, amount, reference_id, status)
      VALUES (gen_random_uuid(), '00000000-0000-0000-0000-000000000000', 'platform_cash', 'debit', $1, $2, 'completed')`,
-    [parsedAmount, razorpay_order_id]
+    [parsedAmount, razorpay_payment_id]
   );
 
   // Update wallet balance
