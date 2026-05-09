@@ -805,10 +805,33 @@ async function handleSessionAccept(userId, event) {
   const sessionType = session.requested_session_type || "chat";
   const baseRate = parseFloat(session.rate_per_minute);
   const ratePerMinute = sessionType === "video" ? baseRate * 1.5 : baseRate;
-  // chat_discount_percent is read alongside the rate inside the rate-calc block below
-  // (snapshotted into session_segment so mid-session changes can't affect billing).
   // Cancel request timeout schedule
   await deleteRequestTimeoutSchedule(session.request_timeout_schedule);
+
+  // Determine effective rate based on billing_type. Snapshot at accept-time so
+  // any change to mentor_profile or promo_config after this point doesn't
+  // affect billing. Declared OUTSIDE the try block so the WS payload and HTTP
+  // response below can reference it (the mentee app shows this rate during
+  // the session — must match what gets stored in session_segment).
+  let effectiveRate = ratePerMinute;
+  if (session.billing_type === 'free_intro') {
+    effectiveRate = 0;
+  } else if (session.billing_type === 'intro_rate') {
+    // Platform first-session promo: flat rate from promo_config.
+    const cfgRow = (await db.query(
+      `SELECT intro_rate_per_minute FROM promo_config WHERE id = 1`
+    )).rows[0];
+    effectiveRate = parseFloat(cfgRow?.intro_rate_per_minute) || 0;
+  } else if (sessionType === 'chat') {
+    // Paid chat: apply mentor's universal chat discount if set.
+    const mentorRow = (await db.query(
+      `SELECT chat_discount_percent FROM mentor_profile WHERE user_id = $1`,
+      [session.mentor_id]
+    )).rows[0];
+    if (mentorRow?.chat_discount_percent != null) {
+      effectiveRate = baseRate * (1 - mentorRow.chat_discount_percent / 100);
+    }
+  }
 
   const client = await db.connect();
   try {
@@ -819,28 +842,6 @@ async function handleSessionAccept(userId, event) {
        WHERE id = $1`,
       [sessionId]
     );
-
-    // Determine rate based on billing_type. Snapshot at accept-time so any
-    // change to mentor_profile or promo_config after this point doesn't affect billing.
-    let effectiveRate = ratePerMinute;
-    if (session.billing_type === 'free_intro') {
-      effectiveRate = 0;
-    } else if (session.billing_type === 'intro_rate') {
-      // Platform first-session promo: flat rate from promo_config.
-      const cfgRow = (await client.query(
-        `SELECT intro_rate_per_minute FROM promo_config WHERE id = 1`
-      )).rows[0];
-      effectiveRate = parseFloat(cfgRow?.intro_rate_per_minute) || 0;
-    } else if (sessionType === 'chat') {
-      // Paid chat: apply mentor's universal chat discount if set.
-      const mentorRow = (await client.query(
-        `SELECT chat_discount_percent FROM mentor_profile WHERE user_id = $1`,
-        [session.mentor_id]
-      )).rows[0];
-      if (mentorRow?.chat_discount_percent != null) {
-        effectiveRate = baseRate * (1 - mentorRow.chat_discount_percent / 100);
-      }
-    }
 
     await client.query(
       `INSERT INTO session_segment (session_id, type, rate_per_minute, started_at)
@@ -1006,14 +1007,17 @@ system_event: `${sessionType}_started`,
 
   const minDurationSecs = parseInt(process.env.MIN_SESSION_DURATION_SECS ?? '60', 10);
 
-  // Push to mentee: session accepted
+  // Push to mentee: session accepted. effectiveRate is the snapshotted billing
+  // rate (₹5 for intro_rate, chat-discounted for paid chat with discount, base
+  // otherwise) — must match session_segment.rate_per_minute so the in-session
+  // UI shows what the mentee is actually being billed.
   const menteeWsPayload = {
     type: "session_accepted",
     session_id: sessionId,
     mentor_id: userId,
     session_type: sessionType,
     billing_type: session.billing_type || 'paid',
-    rate_per_minute: session.billing_type === 'free_intro' ? 0 : ratePerMinute,
+    rate_per_minute: effectiveRate,
     mentee_balance: menteeBalance,
     max_duration_seconds: maxDurationSeconds,
     min_duration_secs: minDurationSecs,
@@ -1062,7 +1066,7 @@ system_event: `${sessionType}_started`,
     status: "active",
     session_type: sessionType,
     billing_type: session.billing_type || 'paid',
-    rate_per_minute: session.billing_type === 'free_intro' ? 0 : ratePerMinute,
+    rate_per_minute: effectiveRate,
     mentee_balance: menteeBalance,
     max_duration_seconds: maxDurationSeconds,
     min_duration_secs: minDurationSecs,
@@ -2980,9 +2984,13 @@ async function handleGetActiveSession(userId, event) {
 
   const baseRate = parseFloat(s.mentor_rate);
 
-  // Get current segment info (for active sessions)
+  // Get current segment info (for active sessions). The segment's
+  // rate_per_minute is the authoritative billing rate (snapshotted at accept,
+  // includes intro_rate flat ₹5 / chat-discount / video multiplier as
+  // applicable) — must be used for both UI display and max-duration math.
   let callType = null;
   let sessionType = 'chat';
+  let segmentRate = null;
   let agoraChannel = null;
   let agoraToken = null;
   let agoraUid = null;
@@ -2990,12 +2998,15 @@ async function handleGetActiveSession(userId, event) {
 
   if (s.status === 'active') {
     const segment = await db.query(
-      `SELECT type FROM session_segment
+      `SELECT type, rate_per_minute FROM session_segment
        WHERE session_id = $1 AND ended_at IS NULL
        ORDER BY started_at DESC LIMIT 1`,
       [s.id]
     );
     const segType = segment.rows[0]?.type;
+    segmentRate = segment.rows[0]?.rate_per_minute != null
+      ? parseFloat(segment.rows[0].rate_per_minute)
+      : null;
     if (segType === 'audio' || segType === 'video') {
       callType = segType;
       // Regenerate Agora token for reconnection
@@ -3039,7 +3050,11 @@ async function handleGetActiveSession(userId, event) {
     );
     const totalSpent = spent + parseFloat(runningCost.rows[0].cost);
 
-    const currentRate = callType === 'video' ? baseRate * 1.5 : baseRate;
+    // Prefer the segment's snapshotted rate over baseRate so intro_rate /
+    // chat-discount sessions use the actual billing rate for the math.
+    const currentRate = segmentRate != null
+      ? segmentRate
+      : (callType === 'video' ? baseRate * 1.5 : baseRate);
     if (s.billing_type === 'free_intro') {
       const cfgDuration = (await db.query(`SELECT free_chat_duration_secs FROM promo_config WHERE id = 1`)).rows[0];
       maxDurationSeconds = cfgDuration?.free_chat_duration_secs || 180;
@@ -3064,7 +3079,7 @@ async function handleGetActiveSession(userId, event) {
     my_role: isMentor ? 'mentor' : 'mentee',
     session_type: sessionType,
     billing_type: s.billing_type || 'paid',
-    rate_per_minute: baseRate,
+    rate_per_minute: segmentRate != null ? segmentRate : baseRate,
     other_user_id: otherUserId,
     other_user_name: otherUserName,
     other_user_avatar: otherUserAvatar,
