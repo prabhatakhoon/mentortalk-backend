@@ -499,10 +499,16 @@ async function updateProfile(userId, event) {
     profileUpdates.push(`bio = $${pidx++}`);
     profileValues.push(body.bio);
   }
-  // profile_photo_url writes are diverted to the pending_* columns for admin
-  // moderation. The live column never moves until an admin approves. Handled
-  // outside the multi-field UPDATE below.
+  // profile_photo_url writes split into two intents:
+  //   - upload (string)  → divert to pending_* columns for admin moderation;
+  //                        live column stays put until admin approves.
+  //   - delete (null)    → clear BOTH live and pending; deletion isn't
+  //                        moderated, the mentor just ends up with no photo
+  //                        and mentees fall back to initials.
+  // Handled outside the multi-field UPDATE below either way.
   const wantsPhotoUpdate = body.profile_photo_url !== undefined;
+  const wantsPhotoDelete = wantsPhotoUpdate && body.profile_photo_url == null;
+  const wantsPhotoUpload = wantsPhotoUpdate && !wantsPhotoDelete;
 
   if (body.rate_per_minute !== undefined) {
     const tierResult = await db.query(
@@ -545,17 +551,20 @@ async function updateProfile(userId, event) {
     return respond(400, { error: "No fields to update" });
   }
 
-  // If a previous pending photo exists, capture its S3 key so we can delete
-  // the orphan after committing. The live profile_photo_url is NEVER deleted
-  // here — that only happens in the admin approve handler when the pending
-  // photo is promoted to live.
+  // Capture S3 keys we may need to clean up post-commit:
+  //   - upload: only the prior pending key (live stays, will be cleaned by
+  //             the admin approve handler when pending → live)
+  //   - delete: both the live key AND any pending key (mentor wants neither)
   let previousPendingKey = null;
+  let previousLiveKey = null;
   if (wantsPhotoUpdate) {
     const old = await db.query(
-      `SELECT pending_profile_photo_url FROM mentor_profile WHERE user_id = $1`,
+      `SELECT profile_photo_url, pending_profile_photo_url
+         FROM mentor_profile WHERE user_id = $1`,
       [userId]
     );
     previousPendingKey = old.rows[0]?.pending_profile_photo_url;
+    previousLiveKey = old.rows[0]?.profile_photo_url;
   }
 
   const client = await db.connect();
@@ -576,7 +585,24 @@ async function updateProfile(userId, event) {
       );
     }
 
-    if (wantsPhotoUpdate) {
+    if (wantsPhotoDelete) {
+      // Wipe both live and pending photo state — this is the "Delete photo"
+      // action from the avatar bottom sheet. Mentee read shape (live URL)
+      // becomes null; pending fields all clear so the mentor app no longer
+      // shows an "Under review" overlay.
+      await client.query(
+        `UPDATE mentor_profile SET
+            profile_photo_url                      = NULL,
+            pending_profile_photo_url              = NULL,
+            pending_profile_photo_status           = NULL,
+            pending_profile_photo_rejection_reason = NULL,
+            pending_profile_photo_reviewed_at      = NULL,
+            pending_profile_photo_reviewed_by      = NULL,
+            updated_at                             = NOW()
+          WHERE user_id = $1`,
+        [userId]
+      );
+    } else if (wantsPhotoUpload) {
       // Replacing a pending photo (whether it was under_review or rejected)
       // resets the moderation state — admin reviews the new submission fresh.
       await client.query(
@@ -620,18 +646,29 @@ async function updateProfile(userId, event) {
     client.release();
   }
 
-  // Best-effort cleanup of the previous pending S3 object (if the mentor is
-  // replacing one pending photo with another). We never delete the live
-  // profile_photo_url here — that's only deleted on admin approval, when it's
-  // replaced by the newly approved pending one.
-  if (previousPendingKey && previousPendingKey !== body.profile_photo_url) {
+  // Best-effort S3 cleanup post-commit.
+  //   - delete: remove both old live and old pending keys; the row no longer
+  //             references either, so they'd otherwise orphan in S3.
+  //   - upload: remove only the prior pending key (if it was being replaced).
+  //             Live key stays in S3 until the admin approve handler swaps
+  //             pending → live (it deletes the now-superseded live key).
+  const keysToCleanup = [];
+  if (wantsPhotoDelete) {
+    if (previousLiveKey) keysToCleanup.push(previousLiveKey);
+    if (previousPendingKey) keysToCleanup.push(previousPendingKey);
+  } else if (wantsPhotoUpload) {
+    if (previousPendingKey && previousPendingKey !== body.profile_photo_url) {
+      keysToCleanup.push(previousPendingKey);
+    }
+  }
+  for (const key of keysToCleanup) {
     try {
       await s3Client.send(new DeleteObjectCommand({
         Bucket: BUCKET_NAME,
-        Key: previousPendingKey,
+        Key: key,
       }));
     } catch (e) {
-      console.warn("Failed to delete previous pending photo:", e.message);
+      console.warn("Failed to delete profile photo S3 object:", key, e.message);
     }
   }
   // Return full profile (getProfile already joins user_language)
