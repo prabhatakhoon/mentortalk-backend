@@ -1114,6 +1114,20 @@ async function getReviews(userId, event) {
   const limit = Math.min(parseInt(params.limit) || 10, 50);
   const offset = parseInt(params.offset) || 0;
 
+  // Whitelist sort values; tie-break on created_at DESC for stable pagination.
+  let orderBy;
+  switch (params.sort) {
+    case "rating_high_low":
+      orderBy = "ORDER BY r.rating DESC, r.created_at DESC";
+      break;
+    case "rating_low_high":
+      orderBy = "ORDER BY r.rating ASC, r.created_at DESC";
+      break;
+    case "newest":
+    default:
+      orderBy = "ORDER BY r.created_at DESC";
+  }
+
   const db = await getPool();
 
   // Use LEFT JOINs throughout so the list query always returns the same row
@@ -1137,7 +1151,7 @@ async function getReviews(userId, event) {
      LEFT JOIN session_segment ss ON ss.session_id = s.id
      WHERE r.mentor_id = $1
      GROUP BY r.id, s.started_at, mtp.first_name, mtp.last_name, mtp.profile_photo_url, mps.show_name_in_reviews
-     ORDER BY r.created_at DESC
+     ${orderBy}
      LIMIT $2 OFFSET $3`,
     [userId, limit, offset]
   );
