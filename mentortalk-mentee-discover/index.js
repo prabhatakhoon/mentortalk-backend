@@ -329,7 +329,7 @@ function parseFilterParams(queryParams) {
  * 4. Rank by popularity score (rating + session count)
  * 5. Return with presigned photo URLs
  */
-async function getPopularMentors(db, userId, queryParams, blockedIds = [], menteeIntroPromo = { eligible: false, ratePerMinute: 0 }) {
+async function getPopularMentors(db, userId, queryParams, blockedIds = [], menteeIntroPromo = { eligible: false, ratePerMinute: 0 }, callerIsTest = false) {
   const limit = Math.min(Math.max(parseInt(queryParams.limit || "10"), 1), 50);
   const offset = Math.max(parseInt(queryParams.offset || "0"), 0);
   const { sortBy, gender, categories, type, languages } = parseFilterParams(queryParams);
@@ -395,7 +395,7 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
        FROM mentor_profile mp2
        JOIN "user" u ON u.id = mp2.user_id
        WHERE u.account_status = 'active'
-         AND NOT u.is_test_account
+         AND u.is_test_account = ${callerIsTest ? 'TRUE' : 'FALSE'}
          AND EXISTS (SELECT 1 FROM mentorship_application ma WHERE ma.user_id = mp2.user_id AND ma.submission_status = 'approved')
          ${catIds ? `AND EXISTS (SELECT 1 FROM user_mentorship um WHERE um.user_id = mp2.user_id AND um.role = 'mentor' AND um.mentorship_category_id IN (SELECT cat_id FROM mentee_cats))` : ''}
          ${blockedCondition}
@@ -518,7 +518,7 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
  *   ?q=Pr&categories=neet                           → search within NEET mentors
  *   ?categories=jee&sort_by=price_asc&gender=female → filtered + sorted
  */
-async function searchMentors(db, queryParams, blockedIds = [], menteeIntroPromo = { eligible: false, ratePerMinute: 0 }) {
+async function searchMentors(db, queryParams, blockedIds = [], menteeIntroPromo = { eligible: false, ratePerMinute: 0 }, callerIsTest = false) {
   const q = (queryParams.q || "").trim();
   const { sortBy, gender, categories, languages } = parseFilterParams(queryParams);
   const limit = Math.min(Math.max(parseInt(queryParams.limit || "20"), 1), 50);
@@ -538,7 +538,7 @@ async function searchMentors(db, queryParams, blockedIds = [], menteeIntroPromo 
   // Build dynamic query parts
   const conditions = [
     `u.account_status = 'active'`,
-    `NOT u.is_test_account`,
+    `u.is_test_account = ${callerIsTest ? 'TRUE' : 'FALSE'}`,
     `EXISTS (SELECT 1 FROM mentorship_application ma WHERE ma.user_id = u.id AND ma.submission_status = 'approved')`,
   ];
   const joins = [`JOIN mentor_profile mp ON mp.user_id = u.id`];
@@ -980,7 +980,7 @@ async function toggleFollow(db, userId, body) {
 // Query: ?limit=20&offset=0
 // ============================================================
 
-async function getFollowing(db, userId, queryParams, menteeIntroPromo = { eligible: false, ratePerMinute: 0 }) {
+async function getFollowing(db, userId, queryParams, menteeIntroPromo = { eligible: false, ratePerMinute: 0 }, callerIsTest = false) {
   const limit = Math.min(Math.max(parseInt(queryParams.limit || "20"), 1), 50);
   const offset = Math.max(parseInt(queryParams.offset || "0"), 0);
 
@@ -1012,7 +1012,7 @@ async function getFollowing(db, userId, queryParams, menteeIntroPromo = { eligib
      JOIN mentor_profile mp ON mp.user_id = f.mentor_id
     WHERE f.mentee_id = $1
        AND u.account_status = 'active'
-       AND NOT u.is_test_account
+       AND u.is_test_account = ${callerIsTest ? 'TRUE' : 'FALSE'}
      ORDER BY f.created_at DESC
      LIMIT $2 OFFSET $3`,
     [userId, limit, offset]
@@ -1201,17 +1201,25 @@ export const handler = async (event) => {
       const blockedIds = await getBlockedIds(db, userId);
     const menteeIntroPromo = await getMenteeIntroEligible(db, userId);
 
+    // Caller realm: test mentees see only test mentors, real mentees see
+    // only real mentors. Mirrors the cross-realm block at session creation.
+    const callerFlagResult = await db.query(
+      `SELECT is_test_account FROM "user" WHERE id = $1`,
+      [userId]
+    );
+    const callerIsTest = !!callerFlagResult.rows[0]?.is_test_account;
+
     // Banners
     if (method === "GET" && path.endsWith("/banners")) {
       return await getBanners(db);
     }
     // Popular mentors
     if (method === "GET" && path.endsWith("/popular-mentors")) {
-  return await getPopularMentors(db, userId, queryParams, blockedIds, menteeIntroPromo);    }
+  return await getPopularMentors(db, userId, queryParams, blockedIds, menteeIntroPromo, callerIsTest);    }
 
     // Search mentors
     if (method === "GET" && path.endsWith("/search-mentors")) {
-           return await searchMentors(db, queryParams, blockedIds, menteeIntroPromo);
+           return await searchMentors(db, queryParams, blockedIds, menteeIntroPromo, callerIsTest);
 
     }
 
@@ -1240,7 +1248,7 @@ export const handler = async (event) => {
 
     // Following list
     if (method === "GET" && path.endsWith("/following")) {
-      return await getFollowing(db, userId, queryParams, menteeIntroPromo);
+      return await getFollowing(db, userId, queryParams, menteeIntroPromo, callerIsTest);
     }
 ```
 
