@@ -605,6 +605,18 @@ async function handleSessionRequest(menteeId, event) {
   let introRatePerMinute = null;
 
   if (session_type === 'chat' && mentor.intro_promo_enabled) {
+    // Defensive auto-create — onboarding inserts the row at
+    // mentee-onboarding/index.mjs:319, but seeded users (test mentee,
+    // pre-onboarding-feature legacy users, anyone whose onboarding crashed
+    // mid-way) may be missing it. Without this, the rows.length === 0 path
+    // below silently failed eligibility and the mentee was charged the full
+    // chat-discount or base rate — even though discovery (LEFT JOIN) had
+    // already promised the intro rate. Same auto-create pattern as the free
+    // chat handler at :1822-1826.
+    await db.query(
+      `INSERT INTO mentee_promo_status (user_id) VALUES ($1) ON CONFLICT DO NOTHING`,
+      [menteeId]
+    );
     const promoResult = await db.query(
       `SELECT intro_session_id FROM mentee_promo_status WHERE user_id = $1`,
       [menteeId]
