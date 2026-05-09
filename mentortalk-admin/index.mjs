@@ -15,6 +15,7 @@ import {
 } from "@aws-sdk/client-apigatewaymanagementapi";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import pg from "pg";
+import { randomUUID } from "node:crypto";
 import { sendFcmNotification } from "./fcmHelper.js";
 
 const { Pool } = pg;
@@ -948,6 +949,165 @@ const handlers = {
       statusCode: 200,
       body: { message: "User unbanned", user_id: userId },
     };
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/users/:id/seed-test-wallet
+  //
+  // Top up a TEST mentee's wallet without hitting Razorpay. Mirrors the
+  // double-entry pattern used by v017's seed: a wallet_topup credit on the
+  // mentee + a paired platform_cash debit, both flagged is_test = TRUE.
+  //
+  // Hard refusals (403):
+  //   - ENABLE_TEST_ACCOUNT !== "true" on this lambda's env
+  //   - target user.is_test_account = FALSE (production users never seedable)
+  //   - target has no mentee wallet row
+  //
+  // Validations (400):
+  //   - amount is a positive integer in [1, 10000] (rupees)
+  //   - reason is a non-empty string (audit trail)
+  //
+  // Body: { amount, reason, reviewer_id }
+  // Response: { new_balance, transaction_id, reference_id }
+  // ──────────────────────────────────────────────────────────
+  seedTestWallet: async (userId, body) => {
+    if (process.env.ENABLE_TEST_ACCOUNT !== "true") {
+      return {
+        statusCode: 403,
+        body: { error: "Test-account features disabled on this lambda" },
+      };
+    }
+
+    const amount = parseInt(body.amount);
+    const reason = (body.reason || "").trim();
+    const reviewerId = body.reviewer_id;
+
+    if (!amount || amount < 1 || amount > 10000) {
+      return {
+        statusCode: 400,
+        body: { error: "Amount must be an integer between ₹1 and ₹10,000" },
+      };
+    }
+    if (!reason) {
+      return {
+        statusCode: 400,
+        body: { error: "Reason is required for the audit trail" },
+      };
+    }
+    if (!reviewerId) {
+      return {
+        statusCode: 400,
+        body: { error: "reviewer_id is required" },
+      };
+    }
+
+    const db = await getPool();
+
+    // Validate target before opening a transaction.
+    const userCheck = await db.query(
+      `SELECT u.is_test_account, w.id AS wallet_id
+       FROM "user" u
+       LEFT JOIN wallet w ON w.user_id = u.id AND w.type = 'mentee'
+       WHERE u.id = $1`,
+      [userId],
+    );
+    if (userCheck.rows.length === 0) {
+      return { statusCode: 404, body: { error: "User not found" } };
+    }
+    if (!userCheck.rows[0].is_test_account) {
+      return {
+        statusCode: 403,
+        body: { error: "Refusing to seed a production user's wallet" },
+      };
+    }
+    if (!userCheck.rows[0].wallet_id) {
+      return {
+        statusCode: 403,
+        body: { error: "Target user has no mentee wallet" },
+      };
+    }
+    const walletId = userCheck.rows[0].wallet_id;
+
+    // Synthesize a reference_id matching the v017 seed convention
+    // (ADMIN_SEED_ prefix vs TEST_SEED_) so the two are distinguishable in
+    // audit queries but obviously paired.
+    const referenceId = `ADMIN_SEED_${randomUUID()}`;
+
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Mentee credit (wallet_topup, is_test = TRUE)
+      const txnRes = await client.query(
+        `INSERT INTO transaction (
+           id, wallet_id, user_id, type, direction, amount,
+           reference_id, status, notes, is_test
+         )
+         VALUES (gen_random_uuid(), $1, $2, 'wallet_topup', 'credit', $3,
+                 $4, 'completed', $5, TRUE)
+         RETURNING id`,
+        [walletId, userId, amount, referenceId, `ADMIN SEED — ${reason}`],
+      );
+      const txnId = txnRes.rows[0].id;
+
+      // Platform-side debit (platform_cash, is_test = TRUE)
+      // Same reference_id so the pair is discoverable.
+      await client.query(
+        `INSERT INTO transaction (
+           id, user_id, type, direction, amount,
+           reference_id, status, notes, is_test
+         )
+         VALUES (gen_random_uuid(), $1, 'platform_cash', 'debit', $2,
+                 $3, 'completed', $4, TRUE)`,
+        [
+          "00000000-0000-0000-0000-000000000000",
+          amount,
+          referenceId,
+          `ADMIN SEED — platform side of seed for user ${userId}`,
+        ],
+      );
+
+      // Bump the wallet balance.
+      const walletRes = await client.query(
+        `UPDATE wallet SET balance = balance + $2, updated_at = NOW()
+         WHERE id = $1 RETURNING balance`,
+        [walletId, amount],
+      );
+      const newBalance = parseFloat(walletRes.rows[0].balance);
+
+      // Audit log.
+      await client.query(
+        `INSERT INTO admin_action_log (admin_id, target_user_id, action, reason, metadata)
+         VALUES ($1, $2, 'seed_test_wallet', $3, $4)`,
+        [
+          reviewerId,
+          userId,
+          reason,
+          JSON.stringify({
+            amount_rupees: amount,
+            reference_id: referenceId,
+            new_balance: newBalance,
+          }),
+        ],
+      );
+
+      await client.query("COMMIT");
+
+      return {
+        statusCode: 200,
+        body: {
+          message: "Wallet seeded",
+          new_balance: newBalance,
+          transaction_id: txnId,
+          reference_id: referenceId,
+        },
+      };
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
   },
 
   // ──────────────────────────────────────────────────────────
@@ -3795,6 +3955,15 @@ export const handler = async (event) => {
     const unbanMatch = path.match(/\/admin\/users\/([\w-]+)\/unban$/);
     if (unbanMatch && method === "POST") {
       result = await handlers.unbanUser(unbanMatch[1], body);
+      return respond(result);
+    }
+
+    // POST /admin/users/:id/seed-test-wallet
+    const seedWalletMatch = path.match(
+      /\/admin\/users\/([\w-]+)\/seed-test-wallet$/,
+    );
+    if (seedWalletMatch && method === "POST") {
+      result = await handlers.seedTestWallet(seedWalletMatch[1], body);
       return respond(result);
     }
 
