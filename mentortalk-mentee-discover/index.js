@@ -1062,6 +1062,20 @@ async function getMentorReviews(db, queryParams) {
   const limit = Math.min(parseInt(queryParams.limit || "15"), 50);
   const offset = parseInt(queryParams.offset || "0");
 
+  // Whitelist sort values; tie-break on created_at DESC for stable pagination.
+  let orderBy;
+  switch (queryParams.sort) {
+    case "rating_high_low":
+      orderBy = "ORDER BY r.rating DESC, r.created_at DESC";
+      break;
+    case "rating_low_high":
+      orderBy = "ORDER BY r.rating ASC, r.created_at DESC";
+      break;
+    case "newest":
+    default:
+      orderBy = "ORDER BY r.created_at DESC";
+  }
+
   // LEFT JOIN mentee_profile so we don't silently drop reviews where the
   // mentee row has been deleted or was never created (the count query below
   // doesn't apply this filter — INNER JOIN here caused list/total mismatch).
@@ -1083,7 +1097,7 @@ async function getMentorReviews(db, queryParams) {
      LEFT JOIN mentee_profile mp ON mp.user_id = r.mentee_id
      LEFT JOIN mentee_privacy_settings mps ON mps.user_id = r.mentee_id
      WHERE r.mentor_id = $1
-     ORDER BY r.created_at DESC
+     ${orderBy}
      LIMIT $2 OFFSET $3`,
     [mentorId, limit, offset]
   );
