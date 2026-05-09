@@ -47,6 +47,7 @@ let truecallerCredentials = null;
 const TEST_ACCOUNTS = {
   "+910000000000": { apps: ["mentor", "mentee"] },
   "+910000000001": { apps: ["mentee"] },
+  "+910000000002": { apps: ["mentor"] }, // v018: second test mentor for forwarding scenarios
 };
 
 const getDbCredentials = async () => {
