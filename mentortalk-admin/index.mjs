@@ -207,6 +207,17 @@ const presignS3 = async (key, expiresIn = 3600) => {
 
 const last4 = (str) => (str ? String(str).slice(-4) : "");
 
+// Photo moderation rejection reasons. Validated at handler level — see
+// i12_photo_moderation.md §3.2 for why this isn't a DB CHECK constraint.
+// Display labels live in client code (mentor app + admin panel).
+const PHOTO_REJECTION_REASONS = [
+  "inappropriate",
+  "low_quality",
+  "not_your_photo",
+  "contains_contact_info",
+  "other",
+];
+
 // Previous calendar month range, computed in IST and returned as UTC Dates.
 const getPreviousMonthRangeIST = (asOfDate) => {
   const ist = new Date(asOfDate.getTime() + IST_OFFSET_MS);
@@ -2762,6 +2773,630 @@ const handlers = {
     };
   },
 
+  // ──────────────────────────────────────────────────────────
+  // Photo moderation (i12_photo_moderation.md)
+  //   Subjects: mentor_profile.profile_photo (single, dual-column model)
+  //             mentor_photo (gallery, status field on row)
+  //   Reasons:  inappropriate, low_quality, not_your_photo,
+  //             contains_contact_info, other  (validated here, not in DB)
+  //   Audit:    admin_action_log with action prefixed `profile_photo_*`
+  //             or `mentor_photo_*`. metadata always carries photo_url and
+  //             (for mentor_photo) photo_id so the trail is forensic.
+  // ──────────────────────────────────────────────────────────
+
+  // ──────────────────────────────────────────────────────────
+  // GET /admin/photos/pending/profile
+  //   Mentors with a pending or rejected profile photo (admin queue).
+  // ──────────────────────────────────────────────────────────
+  photosPendingProfile: async (queryParams) => {
+    const limit = Math.min(parseInt(queryParams.limit) || 50, 200);
+    const offset = parseInt(queryParams.offset) || 0;
+    const db = await getPool();
+
+    const totalRes = await db.query(
+      `SELECT COUNT(*)::int AS total FROM mentor_profile
+       WHERE pending_profile_photo_status IS NOT NULL`,
+    );
+    const total = totalRes.rows[0].total;
+
+    const rows = await db.query(
+      `SELECT mp.user_id, mp.first_name, mp.last_name,
+              mp.profile_photo_url AS live_photo_url,
+              mp.pending_profile_photo_url,
+              mp.pending_profile_photo_status,
+              mp.pending_profile_photo_rejection_reason,
+              mp.pending_profile_photo_reviewed_at,
+              mp.updated_at
+         FROM mentor_profile mp
+         WHERE mp.pending_profile_photo_status IS NOT NULL
+         ORDER BY
+           CASE WHEN mp.pending_profile_photo_status = 'under_review' THEN 0 ELSE 1 END,
+           mp.updated_at ASC
+         LIMIT $1 OFFSET $2`,
+      [limit, offset],
+    );
+
+    return {
+      statusCode: 200,
+      body: {
+        items: rows.rows.map((r) => ({
+          user_id: r.user_id,
+          name: [r.first_name, r.last_name].filter(Boolean).join(" "),
+          live_photo_url: r.live_photo_url,
+          pending_photo_url: r.pending_profile_photo_url,
+          status: r.pending_profile_photo_status,
+          rejection_reason: r.pending_profile_photo_rejection_reason,
+          reviewed_at: r.pending_profile_photo_reviewed_at,
+          submitted_at: r.updated_at,
+        })),
+        total,
+        has_more: offset + limit < total,
+      },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // GET /admin/photos/pending/mentor-photos
+  //   Mentors with one or more mentor_photo rows in under_review.
+  //   Returned mentor-grouped (one row per mentor) with pending count and
+  //   thumbnails so the admin can decide drill-in vs bulk-approve.
+  // ──────────────────────────────────────────────────────────
+  photosPendingMentorPhotos: async (queryParams) => {
+    const limit = Math.min(parseInt(queryParams.limit) || 50, 200);
+    const offset = parseInt(queryParams.offset) || 0;
+    const db = await getPool();
+
+    const totalRes = await db.query(
+      `SELECT COUNT(DISTINCT user_id)::int AS total
+         FROM mentor_photo WHERE status = 'under_review'`,
+    );
+    const total = totalRes.rows[0].total;
+
+    const rows = await db.query(
+      `WITH pending AS (
+         SELECT user_id,
+                COUNT(*) FILTER (WHERE status = 'under_review') AS pending_count,
+                MIN(created_at) FILTER (WHERE status = 'under_review') AS oldest_pending_at,
+                array_agg(json_build_object(
+                  'id', id,
+                  'photo_url', photo_url,
+                  'sort_order', sort_order,
+                  'created_at', created_at
+                ) ORDER BY sort_order ASC)
+                  FILTER (WHERE status = 'under_review') AS pending_photos
+           FROM mentor_photo
+           WHERE status = 'under_review'
+           GROUP BY user_id
+       )
+       SELECT p.user_id, p.pending_count, p.oldest_pending_at, p.pending_photos,
+              mp.first_name, mp.last_name, mp.profile_photo_url
+         FROM pending p
+         JOIN mentor_profile mp ON mp.user_id = p.user_id
+         ORDER BY p.oldest_pending_at ASC
+         LIMIT $1 OFFSET $2`,
+      [limit, offset],
+    );
+
+    return {
+      statusCode: 200,
+      body: {
+        items: rows.rows.map((r) => ({
+          user_id: r.user_id,
+          name: [r.first_name, r.last_name].filter(Boolean).join(" "),
+          avatar_url: r.profile_photo_url,
+          pending_count: parseInt(r.pending_count),
+          oldest_pending_at: r.oldest_pending_at,
+          pending_photos: r.pending_photos || [],
+        })),
+        total,
+        has_more: offset + limit < total,
+      },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // GET /admin/photos/mentor/:user_id
+  //   Per-mentor full view powering the side-panel drawer:
+  //   live profile photo, pending profile photo (if any), all mentor_photo
+  //   rows grouped by status, plus recent moderation history.
+  // ──────────────────────────────────────────────────────────
+  photosMentorDetail: async (mentorId) => {
+    const db = await getPool();
+
+    const profile = await db.query(
+      `SELECT mp.user_id, mp.first_name, mp.last_name,
+              mp.profile_photo_url,
+              mp.pending_profile_photo_url,
+              mp.pending_profile_photo_status,
+              mp.pending_profile_photo_rejection_reason,
+              mp.pending_profile_photo_reviewed_at,
+              mp.pending_profile_photo_reviewed_by
+         FROM mentor_profile mp
+         WHERE mp.user_id = $1`,
+      [mentorId],
+    );
+    if (profile.rows.length === 0) {
+      return { statusCode: 404, body: { error: "Mentor not found" } };
+    }
+    const p = profile.rows[0];
+
+    const photos = await db.query(
+      `SELECT id, photo_url, sort_order, status, rejection_reason,
+              reviewed_at, reviewed_by, created_at
+         FROM mentor_photo
+         WHERE user_id = $1
+         ORDER BY
+           CASE status
+             WHEN 'under_review' THEN 0
+             WHEN 'rejected'     THEN 1
+             ELSE 2
+           END,
+           sort_order ASC`,
+      [mentorId],
+    );
+
+    const history = await db.query(
+      `SELECT id, action, reason, metadata, admin_id, created_at
+         FROM admin_action_log
+         WHERE target_user_id = $1
+           AND action IN (
+             'profile_photo_approved', 'profile_photo_rejected',
+             'mentor_photo_approved',  'mentor_photo_rejected'
+           )
+         ORDER BY created_at DESC
+         LIMIT 30`,
+      [mentorId],
+    );
+
+    return {
+      statusCode: 200,
+      body: {
+        mentor: {
+          user_id: p.user_id,
+          name: [p.first_name, p.last_name].filter(Boolean).join(" "),
+        },
+        profile_photo: {
+          live_url: p.profile_photo_url,
+          pending: p.pending_profile_photo_url
+            ? {
+                url: p.pending_profile_photo_url,
+                status: p.pending_profile_photo_status,
+                rejection_reason: p.pending_profile_photo_rejection_reason,
+                reviewed_at: p.pending_profile_photo_reviewed_at,
+                reviewed_by: p.pending_profile_photo_reviewed_by,
+              }
+            : null,
+        },
+        mentor_photos: photos.rows.map((r) => ({
+          id: r.id,
+          photo_url: r.photo_url,
+          sort_order: r.sort_order,
+          status: r.status,
+          rejection_reason: r.rejection_reason,
+          reviewed_at: r.reviewed_at,
+          reviewed_by: r.reviewed_by,
+          created_at: r.created_at,
+        })),
+        history: history.rows,
+      },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/photos/profile/:user_id/approve
+  //   Promotes pending profile photo → live, clears pending fields, deletes
+  //   old live S3 object (best-effort), writes audit row, fires FCM.
+  //   Self-approval is rejected (admin who is also the mentor cannot approve
+  //   their own photo). See i12_photo_moderation.md §8.
+  // ──────────────────────────────────────────────────────────
+  photosProfileApprove: async (mentorId, body) => {
+    const reviewerId = body.reviewer_id;
+    if (!reviewerId) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    if (reviewerId === mentorId) {
+      return { statusCode: 403, body: { error: "Cannot approve your own photo" } };
+    }
+    const db = await getPool();
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      const sel = await client.query(
+        `SELECT profile_photo_url, pending_profile_photo_url,
+                pending_profile_photo_status
+           FROM mentor_profile WHERE user_id = $1 FOR UPDATE`,
+        [mentorId],
+      );
+      if (sel.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return { statusCode: 404, body: { error: "Mentor not found" } };
+      }
+      const { profile_photo_url: oldLive, pending_profile_photo_url: pendingUrl,
+              pending_profile_photo_status: pendingStatus } = sel.rows[0];
+      if (!pendingUrl || pendingStatus !== "under_review") {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 409,
+          body: { error: "No pending profile photo to approve" },
+        };
+      }
+
+      await client.query(
+        `UPDATE mentor_profile SET
+            profile_photo_url                      = pending_profile_photo_url,
+            pending_profile_photo_url              = NULL,
+            pending_profile_photo_status           = NULL,
+            pending_profile_photo_rejection_reason = NULL,
+            pending_profile_photo_reviewed_at      = NOW(),
+            pending_profile_photo_reviewed_by      = $2,
+            updated_at                             = NOW()
+          WHERE user_id = $1`,
+        [mentorId, reviewerId],
+      );
+
+      await client.query(
+        `INSERT INTO admin_action_log (admin_id, target_user_id, action, metadata)
+         VALUES ($1, $2, 'profile_photo_approved', $3)`,
+        [reviewerId, mentorId, JSON.stringify({ photo_url: pendingUrl })],
+      );
+
+      await client.query("COMMIT");
+
+      // Best-effort cleanup of the previously live photo (now superseded).
+      if (oldLive && oldLive !== pendingUrl) {
+        try {
+          await s3Client.send(new DeleteObjectCommand({
+            Bucket: BUCKET_NAME,
+            Key: oldLive,
+          }));
+        } catch (e) {
+          console.warn("[photosProfileApprove] S3 delete failed:", e.message);
+        }
+      }
+
+      await pushToUser(mentorId,
+        { type: "profile_photo_approved" },
+        {
+          title: "Photo approved",
+          body: "Your profile photo is now visible to mentees.",
+          data: { type: "profile_photo_approved", deep_link: "mentortalk://account/edit-profile" },
+        },
+      );
+
+      return {
+        statusCode: 200,
+        body: { message: "Profile photo approved", user_id: mentorId },
+      };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/photos/profile/:user_id/reject
+  //   Body: { reviewer_id, reason }
+  //   Marks pending as rejected with reason. Live photo unchanged. Mentor
+  //   sees the reason in edit-profile and must dismiss/replace to retry.
+  // ──────────────────────────────────────────────────────────
+  photosProfileReject: async (mentorId, body) => {
+    const reviewerId = body.reviewer_id;
+    const reason = (body.reason || "").trim();
+    if (!reviewerId) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    if (reviewerId === mentorId) {
+      return { statusCode: 403, body: { error: "Cannot reject your own photo" } };
+    }
+    if (!PHOTO_REJECTION_REASONS.includes(reason)) {
+      return {
+        statusCode: 400,
+        body: {
+          error: `reason must be one of: ${PHOTO_REJECTION_REASONS.join(", ")}`,
+        },
+      };
+    }
+
+    const db = await getPool();
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      const sel = await client.query(
+        `SELECT pending_profile_photo_url, pending_profile_photo_status
+           FROM mentor_profile WHERE user_id = $1 FOR UPDATE`,
+        [mentorId],
+      );
+      if (sel.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return { statusCode: 404, body: { error: "Mentor not found" } };
+      }
+      const { pending_profile_photo_url: pendingUrl,
+              pending_profile_photo_status: pendingStatus } = sel.rows[0];
+      if (!pendingUrl || pendingStatus !== "under_review") {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 409,
+          body: { error: "No pending profile photo to reject" },
+        };
+      }
+
+      await client.query(
+        `UPDATE mentor_profile SET
+            pending_profile_photo_status           = 'rejected',
+            pending_profile_photo_rejection_reason = $2,
+            pending_profile_photo_reviewed_at      = NOW(),
+            pending_profile_photo_reviewed_by      = $3,
+            updated_at                             = NOW()
+          WHERE user_id = $1`,
+        [mentorId, reason, reviewerId],
+      );
+
+      await client.query(
+        `INSERT INTO admin_action_log (admin_id, target_user_id, action, reason, metadata)
+         VALUES ($1, $2, 'profile_photo_rejected', $3, $4)`,
+        [reviewerId, mentorId, reason, JSON.stringify({ photo_url: pendingUrl })],
+      );
+
+      await client.query("COMMIT");
+
+      await pushToUser(mentorId,
+        { type: "profile_photo_rejected", reason },
+        {
+          title: "Photo update needed",
+          body: "Your profile photo couldn't be approved. Tap to see why.",
+          data: { type: "profile_photo_rejected", deep_link: "mentortalk://account/edit-profile" },
+        },
+      );
+
+      return {
+        statusCode: 200,
+        body: {
+          message: "Profile photo rejected",
+          user_id: mentorId,
+          reason,
+        },
+      };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/photos/mentor-photo/:photo_id/approve
+  // ──────────────────────────────────────────────────────────
+  photosMentorPhotoApprove: async (photoId, body) => {
+    const reviewerId = body.reviewer_id;
+    if (!reviewerId) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+
+    const db = await getPool();
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      const sel = await client.query(
+        `SELECT id, user_id, photo_url, status FROM mentor_photo
+          WHERE id = $1 FOR UPDATE`,
+        [photoId],
+      );
+      if (sel.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return { statusCode: 404, body: { error: "Photo not found" } };
+      }
+      const { user_id: mentorId, photo_url: photoUrl, status: currentStatus } = sel.rows[0];
+      if (reviewerId === mentorId) {
+        await client.query("ROLLBACK");
+        return { statusCode: 403, body: { error: "Cannot approve your own photo" } };
+      }
+      if (currentStatus !== "under_review") {
+        await client.query("ROLLBACK");
+        return { statusCode: 409, body: { error: `Photo is already ${currentStatus}` } };
+      }
+
+      await client.query(
+        `UPDATE mentor_photo SET
+            status            = 'approved',
+            rejection_reason  = NULL,
+            reviewed_at       = NOW(),
+            reviewed_by       = $2
+          WHERE id = $1`,
+        [photoId, reviewerId],
+      );
+
+      await client.query(
+        `INSERT INTO admin_action_log (admin_id, target_user_id, action, metadata)
+         VALUES ($1, $2, 'mentor_photo_approved', $3)`,
+        [reviewerId, mentorId,
+          JSON.stringify({ photo_id: photoId, photo_url: photoUrl })],
+      );
+
+      await client.query("COMMIT");
+
+      await pushToUser(mentorId,
+        { type: "mentor_photo_approved", photo_id: photoId },
+        {
+          title: "Photo approved",
+          body: "Your photo is now visible on your profile.",
+          data: { type: "mentor_photo_approved", photo_id: photoId,
+                  deep_link: "mentortalk://account/edit-profile" },
+        },
+      );
+
+      return {
+        statusCode: 200,
+        body: { message: "Photo approved", photo_id: photoId },
+      };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/photos/mentor-photo/:photo_id/reject
+  //   Body: { reviewer_id, reason }
+  // ──────────────────────────────────────────────────────────
+  photosMentorPhotoReject: async (photoId, body) => {
+    const reviewerId = body.reviewer_id;
+    const reason = (body.reason || "").trim();
+    if (!reviewerId) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    if (!PHOTO_REJECTION_REASONS.includes(reason)) {
+      return {
+        statusCode: 400,
+        body: {
+          error: `reason must be one of: ${PHOTO_REJECTION_REASONS.join(", ")}`,
+        },
+      };
+    }
+
+    const db = await getPool();
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+
+      const sel = await client.query(
+        `SELECT id, user_id, photo_url, status FROM mentor_photo
+          WHERE id = $1 FOR UPDATE`,
+        [photoId],
+      );
+      if (sel.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return { statusCode: 404, body: { error: "Photo not found" } };
+      }
+      const { user_id: mentorId, photo_url: photoUrl, status: currentStatus } = sel.rows[0];
+      if (reviewerId === mentorId) {
+        await client.query("ROLLBACK");
+        return { statusCode: 403, body: { error: "Cannot reject your own photo" } };
+      }
+      if (currentStatus !== "under_review") {
+        await client.query("ROLLBACK");
+        return { statusCode: 409, body: { error: `Photo is already ${currentStatus}` } };
+      }
+
+      await client.query(
+        `UPDATE mentor_photo SET
+            status            = 'rejected',
+            rejection_reason  = $2,
+            reviewed_at       = NOW(),
+            reviewed_by       = $3
+          WHERE id = $1`,
+        [photoId, reason, reviewerId],
+      );
+
+      await client.query(
+        `INSERT INTO admin_action_log (admin_id, target_user_id, action, reason, metadata)
+         VALUES ($1, $2, 'mentor_photo_rejected', $3, $4)`,
+        [reviewerId, mentorId, reason,
+          JSON.stringify({ photo_id: photoId, photo_url: photoUrl })],
+      );
+
+      await client.query("COMMIT");
+
+      await pushToUser(mentorId,
+        { type: "mentor_photo_rejected", photo_id: photoId, reason },
+        {
+          title: "Photo update needed",
+          body: "One of your photos couldn't be approved. Tap to see why.",
+          data: { type: "mentor_photo_rejected", photo_id: photoId,
+                  deep_link: "mentortalk://account/edit-profile" },
+        },
+      );
+
+      return {
+        statusCode: 200,
+        body: { message: "Photo rejected", photo_id: photoId, reason },
+      };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/photos/profile/bulk-approve
+  //   Body: { reviewer_id, user_ids: [...] }
+  //   Loops one-by-one (each is its own transaction so a failure mid-batch
+  //   doesn't roll the others back). Returns 207 with per-id results when any
+  //   item fails.
+  // ──────────────────────────────────────────────────────────
+  photosProfileBulkApprove: async (body) => {
+    const reviewerId = body.reviewer_id;
+    const userIds = Array.isArray(body.user_ids) ? body.user_ids : [];
+    if (!reviewerId) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    if (userIds.length === 0) {
+      return { statusCode: 400, body: { error: "user_ids must be a non-empty array" } };
+    }
+    if (userIds.length > 100) {
+      return { statusCode: 400, body: { error: "Max 100 user_ids per call" } };
+    }
+
+    const results = [];
+    for (const userId of userIds) {
+      try {
+        const r = await handlers.photosProfileApprove(userId, { reviewer_id: reviewerId });
+        results.push({ user_id: userId, statusCode: r.statusCode, body: r.body });
+      } catch (e) {
+        results.push({ user_id: userId, statusCode: 500, body: { error: e.message } });
+      }
+    }
+
+    const allOk = results.every((r) => r.statusCode === 200);
+    return {
+      statusCode: allOk ? 200 : 207,
+      body: { results },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/photos/mentor-photo/bulk-approve
+  //   Body: { reviewer_id, photo_ids: [...] }
+  // ──────────────────────────────────────────────────────────
+  photosMentorPhotoBulkApprove: async (body) => {
+    const reviewerId = body.reviewer_id;
+    const photoIds = Array.isArray(body.photo_ids) ? body.photo_ids : [];
+    if (!reviewerId) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    if (photoIds.length === 0) {
+      return { statusCode: 400, body: { error: "photo_ids must be a non-empty array" } };
+    }
+    if (photoIds.length > 100) {
+      return { statusCode: 400, body: { error: "Max 100 photo_ids per call" } };
+    }
+
+    const results = [];
+    for (const photoId of photoIds) {
+      try {
+        const r = await handlers.photosMentorPhotoApprove(photoId, { reviewer_id: reviewerId });
+        results.push({ photo_id: photoId, statusCode: r.statusCode, body: r.body });
+      } catch (e) {
+        results.push({ photo_id: photoId, statusCode: 500, body: { error: e.message } });
+      }
+    }
+
+    const allOk = results.every((r) => r.statusCode === 200);
+    return {
+      statusCode: allOk ? 200 : 207,
+      body: { results },
+    };
+  },
+
   // ── App Config (DynamoDB: mentortalk-app-config) ─────────
 
   getAppConfig: async (key) => {
@@ -3215,6 +3850,85 @@ export const handler = async (event) => {
     const retryMatch = path.match(/\/admin\/payouts\/([\w-]+)\/retry$/);
     if (retryMatch && method === "POST") {
       result = await handlers.payoutsRetry(retryMatch[1], body);
+      return respond(result);
+    }
+
+    // ── Photo moderation (i12_photo_moderation.md) ──────────
+
+    // GET /admin/photos/pending/profile
+    if (path.match(/\/admin\/photos\/pending\/profile\/?$/) && method === "GET") {
+      const queryParams = event.queryStringParameters || {};
+      result = await handlers.photosPendingProfile(queryParams);
+      return respond(result);
+    }
+
+    // GET /admin/photos/pending/mentor-photos
+    if (path.match(/\/admin\/photos\/pending\/mentor-photos\/?$/) && method === "GET") {
+      const queryParams = event.queryStringParameters || {};
+      result = await handlers.photosPendingMentorPhotos(queryParams);
+      return respond(result);
+    }
+
+    // GET /admin/photos/mentor/:user_id
+    const photosMentorDetailMatch = path.match(
+      /\/admin\/photos\/mentor\/([\w-]+)$/,
+    );
+    if (photosMentorDetailMatch && method === "GET") {
+      result = await handlers.photosMentorDetail(photosMentorDetailMatch[1]);
+      return respond(result);
+    }
+
+    // POST /admin/photos/profile/bulk-approve
+    if (
+      path.match(/\/admin\/photos\/profile\/bulk-approve\/?$/) &&
+      method === "POST"
+    ) {
+      result = await handlers.photosProfileBulkApprove(body);
+      return respond(result);
+    }
+
+    // POST /admin/photos/mentor-photo/bulk-approve
+    if (
+      path.match(/\/admin\/photos\/mentor-photo\/bulk-approve\/?$/) &&
+      method === "POST"
+    ) {
+      result = await handlers.photosMentorPhotoBulkApprove(body);
+      return respond(result);
+    }
+
+    // POST /admin/photos/profile/:user_id/approve
+    const photosProfileApproveMatch = path.match(
+      /\/admin\/photos\/profile\/([\w-]+)\/approve$/,
+    );
+    if (photosProfileApproveMatch && method === "POST") {
+      result = await handlers.photosProfileApprove(photosProfileApproveMatch[1], body);
+      return respond(result);
+    }
+
+    // POST /admin/photos/profile/:user_id/reject
+    const photosProfileRejectMatch = path.match(
+      /\/admin\/photos\/profile\/([\w-]+)\/reject$/,
+    );
+    if (photosProfileRejectMatch && method === "POST") {
+      result = await handlers.photosProfileReject(photosProfileRejectMatch[1], body);
+      return respond(result);
+    }
+
+    // POST /admin/photos/mentor-photo/:photo_id/approve
+    const photosMentorPhotoApproveMatch = path.match(
+      /\/admin\/photos\/mentor-photo\/([\w-]+)\/approve$/,
+    );
+    if (photosMentorPhotoApproveMatch && method === "POST") {
+      result = await handlers.photosMentorPhotoApprove(photosMentorPhotoApproveMatch[1], body);
+      return respond(result);
+    }
+
+    // POST /admin/photos/mentor-photo/:photo_id/reject
+    const photosMentorPhotoRejectMatch = path.match(
+      /\/admin\/photos\/mentor-photo\/([\w-]+)\/reject$/,
+    );
+    if (photosMentorPhotoRejectMatch && method === "POST") {
+      result = await handlers.photosMentorPhotoReject(photosMentorPhotoRejectMatch[1], body);
       return respond(result);
     }
 
