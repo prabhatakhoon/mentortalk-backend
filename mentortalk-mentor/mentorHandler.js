@@ -362,7 +362,11 @@ async function getProfile(userId) {
     `SELECT
        u.id, mp.first_name, mp.last_name, u.phone_number,
        u.created_at AS member_since,
-       mp.profile_photo_url, mp.bio, mp.rate_per_minute,
+       mp.profile_photo_url,
+       mp.pending_profile_photo_url,
+       mp.pending_profile_photo_status,
+       mp.pending_profile_photo_rejection_reason,
+       mp.bio, mp.rate_per_minute,
        mp.is_available, mp.pref_audio, mp.pref_video,
        mp.chat_discount_percent,
        mp.rules_acknowledged_at,
@@ -396,8 +400,11 @@ LEFT JOIN user_language ul ON ul.user_id = u.id AND ul.role = 'mentor'
 
   const row = result.rows[0];
 
+  // Mentor's own profile shows ALL their photos regardless of status, with
+  // status + rejection_reason so the app can render badges. Mentees only see
+  // approved rows — that filter lives on mentee-discover, not here.
   const photosResult = await db.query(
-    `SELECT id, photo_url, sort_order
+    `SELECT id, photo_url, sort_order, status, rejection_reason
      FROM mentor_photo
      WHERE user_id = $1
      ORDER BY sort_order ASC`,
@@ -406,14 +413,23 @@ LEFT JOIN user_language ul ON ul.user_id = u.id AND ul.role = 'mentor'
   const photos = photosResult.rows.map((p) => ({
     id: p.id,
     url: toFullUrl(p.photo_url),
+    status: p.status,
+    rejection_reason: p.rejection_reason,
   }));
+
+  // For the mentor's own view, show the pending photo if any (so they see
+  // what they just uploaded). Mentee-side reads always use the live column
+  // (mp.profile_photo_url) directly — moderation never affects mentee shape.
+  const visibleProfilePhoto = row.pending_profile_photo_url || row.profile_photo_url;
 
   return respond(200, {
     id: row.id,
     first_name: row.first_name,
     last_name: row.last_name,
     phone_number: row.phone_number,
-    profile_image_url: toFullUrl(row.profile_photo_url),
+    profile_image_url: toFullUrl(visibleProfilePhoto),
+    pending_profile_photo_status: row.pending_profile_photo_status,
+    pending_profile_photo_rejection_reason: row.pending_profile_photo_rejection_reason,
     photos,
     bio: row.bio,
     rate_per_minute: row.rate_per_minute ? parseFloat(row.rate_per_minute) : null,
@@ -483,10 +499,11 @@ async function updateProfile(userId, event) {
     profileUpdates.push(`bio = $${pidx++}`);
     profileValues.push(body.bio);
   }
-  if (body.profile_photo_url !== undefined) {
-    profileUpdates.push(`profile_photo_url = $${pidx++}`);
-    profileValues.push(body.profile_photo_url);
-  }
+  // profile_photo_url writes are diverted to the pending_* columns for admin
+  // moderation. The live column never moves until an admin approves. Handled
+  // outside the multi-field UPDATE below.
+  const wantsPhotoUpdate = body.profile_photo_url !== undefined;
+
   if (body.rate_per_minute !== undefined) {
     const tierResult = await db.query(
       `SELECT rt.max_rate FROM mentor_profile mp
@@ -524,17 +541,21 @@ async function updateProfile(userId, event) {
   // ── Languages (ISO 639-1 codes via user_language junction table) ──
   const hasLanguages = body.languages !== undefined && Array.isArray(body.languages);
 
-  if (userUpdates.length === 0 && profileUpdates.length === 0 && !hasLanguages) {
+  if (userUpdates.length === 0 && profileUpdates.length === 0 && !hasLanguages && !wantsPhotoUpdate) {
     return respond(400, { error: "No fields to update" });
   }
 
-  let oldPhotoKey = null;
-  if (body.profile_photo_url !== undefined) {
+  // If a previous pending photo exists, capture its S3 key so we can delete
+  // the orphan after committing. The live profile_photo_url is NEVER deleted
+  // here — that only happens in the admin approve handler when the pending
+  // photo is promoted to live.
+  let previousPendingKey = null;
+  if (wantsPhotoUpdate) {
     const old = await db.query(
-      `SELECT profile_photo_url FROM mentor_profile WHERE user_id = $1`,
+      `SELECT pending_profile_photo_url FROM mentor_profile WHERE user_id = $1`,
       [userId]
     );
-    oldPhotoKey = old.rows[0]?.profile_photo_url;
+    previousPendingKey = old.rows[0]?.pending_profile_photo_url;
   }
 
   const client = await db.connect();
@@ -552,6 +573,22 @@ async function updateProfile(userId, event) {
       await client.query(
         `UPDATE mentor_profile SET ${profileUpdates.join(", ")}, updated_at = NOW() WHERE user_id = $${pidx}`,
         [...profileValues, userId]
+      );
+    }
+
+    if (wantsPhotoUpdate) {
+      // Replacing a pending photo (whether it was under_review or rejected)
+      // resets the moderation state — admin reviews the new submission fresh.
+      await client.query(
+        `UPDATE mentor_profile SET
+            pending_profile_photo_url              = $1,
+            pending_profile_photo_status           = 'under_review',
+            pending_profile_photo_rejection_reason = NULL,
+            pending_profile_photo_reviewed_at      = NULL,
+            pending_profile_photo_reviewed_by      = NULL,
+            updated_at                             = NOW()
+          WHERE user_id = $2`,
+        [body.profile_photo_url, userId]
       );
     }
 
@@ -583,14 +620,18 @@ async function updateProfile(userId, event) {
     client.release();
   }
 
-  if (oldPhotoKey) {
+  // Best-effort cleanup of the previous pending S3 object (if the mentor is
+  // replacing one pending photo with another). We never delete the live
+  // profile_photo_url here — that's only deleted on admin approval, when it's
+  // replaced by the newly approved pending one.
+  if (previousPendingKey && previousPendingKey !== body.profile_photo_url) {
     try {
       await s3Client.send(new DeleteObjectCommand({
         Bucket: BUCKET_NAME,
-        Key: oldPhotoKey,
+        Key: previousPendingKey,
       }));
     } catch (e) {
-      console.warn("Failed to delete old photo:", e.message);
+      console.warn("Failed to delete previous pending photo:", e.message);
     }
   }
   // Return full profile (getProfile already joins user_language)
@@ -1986,6 +2027,9 @@ async function profilePhotoPresign(userId, event) {
 // ─── POST /mentor/photos ─────────────────────────────────────
 // Body: { s3_key }
 // Inserts one mentor_photo row at the next sort_order. Caps at 5 (422).
+// New rows start at status='under_review' and are not visible to mentees
+// until an admin approves. The 5-cap counts ALL statuses (rejected included)
+// — mentor must delete a rejected photo to free a slot.
 
 async function addMentorPhoto(userId, event) {
   const body = JSON.parse(event.body || "{}");
@@ -2015,10 +2059,12 @@ async function addMentorPhoto(userId, event) {
   );
   const nextOrder = nextOrderResult.rows[0].next_order;
 
+  // Explicit status='under_review' — column DEFAULT is also under_review post
+  // v015 migration but pinning it here keeps the contract obvious.
   const insertResult = await db.query(
-    `INSERT INTO mentor_photo (user_id, photo_url, sort_order)
-     VALUES ($1, $2, $3)
-     RETURNING id, photo_url, sort_order, created_at`,
+    `INSERT INTO mentor_photo (user_id, photo_url, sort_order, status)
+     VALUES ($1, $2, $3, 'under_review')
+     RETURNING id, photo_url, sort_order, status, created_at`,
     [userId, s3Key, nextOrder]
   );
   const row = insertResult.rows[0];
@@ -2027,6 +2073,8 @@ async function addMentorPhoto(userId, event) {
     id: row.id,
     url: toFullUrl(row.photo_url),
     sort_order: row.sort_order,
+    status: row.status,
+    rejection_reason: null,
   });
 }
 
