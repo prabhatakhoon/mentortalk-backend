@@ -1073,8 +1073,13 @@ const handlers = {
     // whose fcmHelper still reads it during the rollout window push to the
     // most recently registered device for this user (matches today's
     // behaviour). The post-migration helper reads ${app}_fcm_token instead.
+    // Cast required: ${fcmColumn} is VARCHAR(255) (v016) and fcm_token is TEXT
+    // (legacy). Reusing $2 across both without a cast trips Postgres'
+    // "inconsistent types deduced for parameter" — varchar vs text. Cast to
+    // text and rely on text→varchar implicit coercion. Legacy column goes
+    // away in TD-008 and this becomes a single assignment.
     await db.query(
-      `UPDATE "user" SET ${fcmColumn} = $2, fcm_token = $2 WHERE id = $1`,
+      `UPDATE "user" SET ${fcmColumn} = $2::text, fcm_token = $2::text WHERE id = $1`,
       [userId, fcm_token],
     );
 
