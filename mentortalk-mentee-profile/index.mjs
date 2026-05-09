@@ -861,7 +861,11 @@ async function getReviews(db, userId, queryParams) {
   const limit = Math.min(parseInt(queryParams.limit || "15"), 50);
   const offset = parseInt(queryParams.offset || "0");
 
-  // Paginated reviews with mentor info
+  // LEFT JOIN session/mentor_profile so the list always returns the same row
+  // count as the COUNT(*) below — INNER joins were silently dropping reviews
+  // whose session/mentor_profile rows had been deleted (mentor account
+  // closure, session purge), while the count still counted them. Response
+  // construction already falls back to "Mentor" when the name is null.
   const { rows: reviews } = await db.query(
     `SELECT
        r.id,
@@ -874,8 +878,8 @@ async function getReviews(db, userId, queryParams) {
        mp.last_name  AS mentor_last_name,
        mp.profile_photo_url AS mentor_photo_url
      FROM review r
-     JOIN session s ON s.id = r.session_id
-     JOIN mentor_profile mp ON mp.user_id = r.mentor_id
+     LEFT JOIN session s ON s.id = r.session_id
+     LEFT JOIN mentor_profile mp ON mp.user_id = r.mentor_id
      WHERE r.mentee_id = $1
      ORDER BY r.created_at DESC
      LIMIT $2 OFFSET $3`,
