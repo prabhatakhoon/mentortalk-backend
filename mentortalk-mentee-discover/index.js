@@ -1060,6 +1060,10 @@ async function getMentorReviews(db, queryParams) {
   const limit = Math.min(parseInt(queryParams.limit || "15"), 50);
   const offset = parseInt(queryParams.offset || "0");
 
+  // LEFT JOIN mentee_profile so we don't silently drop reviews where the
+  // mentee row has been deleted or was never created (the count query below
+  // doesn't apply this filter — INNER JOIN here caused list/total mismatch).
+  // Response construction already falls back to "Mentee" when name is null.
   const { rows: reviews } = await db.query(
     `SELECT
        r.id,
@@ -1073,8 +1077,8 @@ async function getMentorReviews(db, queryParams) {
        mp.profile_photo_url AS mentee_photo_url,
        COALESCE(mps.show_name_in_reviews, TRUE) AS show_name
      FROM review r
-     JOIN session s ON s.id = r.session_id
-     JOIN mentee_profile mp ON mp.user_id = r.mentee_id
+     LEFT JOIN session s ON s.id = r.session_id
+     LEFT JOIN mentee_profile mp ON mp.user_id = r.mentee_id
      LEFT JOIN mentee_privacy_settings mps ON mps.user_id = r.mentee_id
      WHERE r.mentor_id = $1
      ORDER BY r.created_at DESC
