@@ -1125,7 +1125,7 @@ async function handleSessionReject(userId, event) {
   const db = await getPool();
 
   const sessionData = await db.query(
-    `SELECT request_timeout_schedule, billing_type, mentee_id FROM session
+    `SELECT request_timeout_schedule, billing_type, mentee_id, is_test FROM session
      WHERE id = $1 AND mentor_id = $2 AND status = 'requested'`,
     [sessionId, userId]
   );
@@ -1152,6 +1152,21 @@ async function handleSessionReject(userId, event) {
     }
 
     const remainingMentors = queue?.remaining_mentors || [];
+
+    // Realm re-check: queue was seeded from a realm-filtered candidate query
+    // at handleFreeChat, but a stale queue (admin tooling, realm flip after
+    // seeding, future code paths) could surface a mentor in the wrong realm.
+    // Defense in depth — fetch the eligible-realm subset up front and skip
+    // anything not in it. Single roundtrip vs N+1.
+    let realmEligible = new Set();
+    if (remainingMentors.length > 0) {
+      const realmCheck = await db.query(
+        `SELECT id FROM "user" WHERE id = ANY($1) AND is_test_account = $2`,
+        [remainingMentors, session.is_test]
+      );
+      realmEligible = new Set(realmCheck.rows.map((r) => r.id));
+    }
+
     let nextMentor = null;
     const stillRemaining = [];
 
@@ -1160,6 +1175,8 @@ async function handleSessionReject(userId, event) {
         stillRemaining.push(mentorId);
         continue;
       }
+
+      if (!realmEligible.has(mentorId)) continue;
 
       const presence = await dynamoClient.send(new GetCommand({
         TableName: "mentortalk-presence",
