@@ -851,10 +851,12 @@ async function getMentorProfile(db, userId, queryParams, menteeIntroPromo = { el
   const photoUrl = await resolvePhotoUrl(row.profile_photo_url, mentorId);
 
   // ── 6b. Mentor extra photos (max 5) ──
+  // Mentees only ever see admin-approved photos. Pending/rejected rows are
+  // hidden by status filter — see i12_photo_moderation.md.
   const photosResult = await db.query(
     `SELECT id, photo_url
      FROM mentor_photo
-     WHERE user_id = $1
+     WHERE user_id = $1 AND status = 'approved'
      ORDER BY sort_order ASC`,
     [mentorId]
   );
