@@ -163,6 +163,20 @@ async function createOrder(db, userId, body) {
     return res(400, { message: "Maximum top-up amount is ₹10,000" });
   }
 
+  // Realm gate: never let a test account hit the live Razorpay key. The
+  // verify path tags the resulting transaction is_test=TRUE so the ledger
+  // would stay clean, but the rupees on the card are already gone. Test
+  // mentees get their wallet seeded via v017 (or a new admin endpoint);
+  // they should never need to top up.
+  const userCheck = await db.query(
+    `SELECT is_test_account FROM "user" WHERE id = $1`,
+    [userId]
+  );
+  if (userCheck.rows[0]?.is_test_account) {
+    console.warn("[WALLET] Top-up blocked for test account:", userId);
+    return res(403, { message: "Top-up is not available for test accounts" });
+  }
+
   const { key_id, key_secret } = await getRazorpayKeys();
 
   // Create Razorpay order via their API
