@@ -3038,11 +3038,26 @@ const handlers = {
       }
       const { profile_photo_url: oldLive, pending_profile_photo_url: pendingUrl,
               pending_profile_photo_status: pendingStatus } = sel.rows[0];
-      if (!pendingUrl || pendingStatus !== "under_review") {
+      // Idempotent: a double-click after a successful approve clears pending,
+      // so the second call sees no pending and reports success rather than
+      // surfacing a 500 to the admin.
+      if (!pendingUrl) {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 200,
+          body: {
+            message: "Profile photo already approved",
+            user_id: mentorId,
+          },
+        };
+      }
+      if (pendingStatus !== "under_review") {
         await client.query("ROLLBACK");
         return {
           statusCode: 409,
-          body: { error: "No pending profile photo to approve" },
+          body: {
+            error: "Pending photo was rejected — mentor must re-upload",
+          },
         };
       }
 
@@ -3140,11 +3155,23 @@ const handlers = {
       }
       const { pending_profile_photo_url: pendingUrl,
               pending_profile_photo_status: pendingStatus } = sel.rows[0];
-      if (!pendingUrl || pendingStatus !== "under_review") {
+      if (!pendingUrl) {
         await client.query("ROLLBACK");
         return {
           statusCode: 409,
           body: { error: "No pending profile photo to reject" },
+        };
+      }
+      // Idempotent retry: photo is already rejected — accept the call as
+      // a no-op success rather than throwing.
+      if (pendingStatus === "rejected") {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 200,
+          body: {
+            message: "Profile photo already rejected",
+            user_id: mentorId,
+          },
         };
       }
 
@@ -3219,6 +3246,15 @@ const handlers = {
       if (reviewerId === mentorId) {
         await client.query("ROLLBACK");
         return { statusCode: 403, body: { error: "Cannot approve your own photo" } };
+      }
+      // Idempotent: already approved is a no-op success; rejected stays an
+      // error since the admin must explicitly recover from rejection.
+      if (currentStatus === "approved") {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 200,
+          body: { message: "Photo already approved", photo_id: photoId },
+        };
       }
       if (currentStatus !== "under_review") {
         await client.query("ROLLBACK");
@@ -3303,6 +3339,15 @@ const handlers = {
       if (reviewerId === mentorId) {
         await client.query("ROLLBACK");
         return { statusCode: 403, body: { error: "Cannot reject your own photo" } };
+      }
+      // Idempotent retry on already-rejected; approved-then-reject still
+      // errors so the admin doesn't accidentally retract an approval.
+      if (currentStatus === "rejected") {
+        await client.query("ROLLBACK");
+        return {
+          statusCode: 200,
+          body: { message: "Photo already rejected", photo_id: photoId },
+        };
       }
       if (currentStatus !== "under_review") {
         await client.query("ROLLBACK");
