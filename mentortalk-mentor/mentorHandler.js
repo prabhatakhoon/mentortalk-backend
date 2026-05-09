@@ -1038,6 +1038,10 @@ async function getReviews(userId, event) {
 
   const db = await getPool();
 
+  // Use LEFT JOINs throughout so the list query always returns the same row
+  // count as the COUNT(*) below — INNER joins were silently dropping reviews
+  // whose session/user/mentee_profile rows had been deleted, while the count
+  // still counted them. The unused JOIN "user" was also removed.
   const result = await db.query(
     `SELECT
        r.id, r.rating, r.comment, r.created_at,
@@ -1049,8 +1053,7 @@ async function getReviews(userId, event) {
        COALESCE(mps.show_name_in_reviews, TRUE) AS show_name,
        array_agg(DISTINCT ss.type) FILTER (WHERE ss.type IS NOT NULL) AS modes
      FROM review r
-     JOIN session s ON s.id = r.session_id
-     JOIN "user" u ON u.id = r.mentee_id
+     LEFT JOIN session s ON s.id = r.session_id
      LEFT JOIN mentee_profile mtp ON mtp.user_id = r.mentee_id
      LEFT JOIN mentee_privacy_settings mps ON mps.user_id = r.mentee_id
      LEFT JOIN session_segment ss ON ss.session_id = s.id
