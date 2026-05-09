@@ -39,7 +39,15 @@ const secretsClient = new SecretsManagerClient({ region: "ap-south-1" });
 let pool = null;
 let jwtSecret = null;
 let truecallerCredentials = null;
-const TEST_PHONE_NUMBER = "+910000000000";
+// Test accounts. Each entry maps a phone number to the apps allowed to bypass
+// Truecaller/OTP for it. The mentor reviewer phone is dual-app (Play Store
+// review covers both); the mentee tester phone is mentee-only so the mentor
+// app can never log in as it. Server-side gate: only honoured when
+// process.env.ENABLE_TEST_ACCOUNT === "true".
+const TEST_ACCOUNTS = {
+  "+910000000000": { apps: ["mentor", "mentee"] },
+  "+910000000001": { apps: ["mentee"] },
+};
 
 const getDbCredentials = async () => {
   const response = await secretsClient.send(
@@ -86,12 +94,21 @@ const getPool = async () => {
 const generateTokens = async (user, appConfig) => {
   const secret = await getJwtSecret();
 
+  // Per-app token_version. user object may come from a SELECT that fetched
+  // either the new column or the legacy one — prefer the per-app column,
+  // fall back to legacy. Default 0 keeps brand-new users (just inserted with
+  // column DEFAULT 0) consistent.
+  const versionColumn =
+    appConfig.app === "mentor" ? "mentor_token_version" : "mentee_token_version";
+  const tokenVersion =
+    user[versionColumn] ?? user.token_version ?? 0;
+
   const accessToken = jwt.sign(
     {
       sub: user.id,
       role: appConfig.default_role,
       app: appConfig.app,
-      token_version: user.token_version,
+      token_version: tokenVersion,
     },
     secret,
     { expiresIn: "15m" },
@@ -104,8 +121,8 @@ const generateTokens = async (user, appConfig) => {
 
   const db = await getPool();
   await db.query(
-    `INSERT INTO refresh_token (user_id, token_hash, expires_at) VALUES ($1, $2, NOW() + INTERVAL '1 year')`,
-    [user.id, refreshTokenHash],
+    `INSERT INTO refresh_token (user_id, token_hash, expires_at, app) VALUES ($1, $2, NOW() + INTERVAL '1 year', $3)`,
+    [user.id, refreshTokenHash, appConfig.app],
   );
 
   return { accessToken, refreshToken };
@@ -195,13 +212,14 @@ const findOrCreateUserAndRespond = async (
     const role = appConfig.default_role;
 
     const insertResult = await db.query(
-      `INSERT INTO "user" (phone_number, registered_as, auth_method, first_name, last_name)
-       VALUES ($1, $2, 'truecaller_oauth', $3, $4) RETURNING *`,
+      `INSERT INTO "user" (phone_number, registered_as, auth_method, first_name, last_name, is_test_account)
+       VALUES ($1, $2, 'truecaller_oauth', $3, $4, $5) RETURNING *`,
       [
         phoneNumber,
         role,
         isOAuth ? firstName : null,
         isOAuth ? lastName : null,
+        !!TEST_ACCOUNTS[phoneNumber],
       ],
     );
     user = insertResult.rows[0];
@@ -289,28 +307,61 @@ const findOrCreateUserAndRespond = async (
     }
   }
 
-  // ── Force logout old device (single-device enforcement) ────
-  // Send FCM to old device before invalidating (best-effort)
-  await sendFcmNotification(user.id, {
-    title: "Signed in on another device",
-    body: "Your MentorTalk account was signed in on another device. You have been logged out.",
-    data: { type: "force_logout", reason: "signed_in_elsewhere" },
-  });
+  // ── Force logout old device on THIS app (per-app single-device) ────
+  // Other-app sessions are untouched. The OTHER app's token_version,
+  // refresh tokens and FCM token all stay valid so a user logged in as
+  // mentor on Phone A and mentee on Phone B keeps both sessions.
+  const versionColumn =
+    appConfig.app === "mentor"
+      ? "mentor_token_version"
+      : "mentee_token_version";
+  const fcmColumn =
+    appConfig.app === "mentor" ? "mentor_fcm_token" : "mentee_fcm_token";
 
-  // Revoke all existing refresh tokens
+  // Send FCM to the previous device for this app (best-effort).
+  await sendFcmNotification(
+    user.id,
+    {
+      title: "Signed in on another device",
+      body: "Your MentorTalk account was signed in on another device. You have been logged out.",
+      data: { type: "force_logout", reason: "signed_in_elsewhere" },
+    },
+    { app: appConfig.app },
+  );
+
+  // Revoke refresh tokens issued to THIS app. NULL rt.app rows are
+  // pre-migration and intentionally spared during the rollout window —
+  // they self-heal on next /auth/refresh use (a new row is inserted with
+  // app set, the old NULL row is revoked). After the rollout window a
+  // separate sweep can revoke stale NULL rows.
   await db.query(
-    `UPDATE refresh_token SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`,
-    [user.id],
+    `UPDATE refresh_token SET revoked_at = NOW()
+     WHERE user_id = $1 AND revoked_at IS NULL AND app = $2`,
+    [user.id, appConfig.app],
   );
 
-  // Increment token_version to invalidate all existing JWTs, clear FCM token
+  // Bump this app's token_version; also bump the legacy column in lockstep
+  // so any ancient JWT without an `app` claim (which falls back to the
+  // legacy column in verifyToken) is also invalidated. Clear only this
+  // app's FCM token; legacy fcm_token is left untouched and will be
+  // overwritten by the OTHER app's next /auth/fcm-token call, or get
+  // cleared by fcmHelper's stale-token detection if it points at the
+  // now-invalidated device.
   const versionResult = await db.query(
-    `UPDATE "user" SET token_version = token_version + 1, fcm_token = NULL, updated_at = NOW() WHERE id = $1 RETURNING token_version`,
+    `UPDATE "user"
+       SET ${versionColumn} = ${versionColumn} + 1,
+           token_version = token_version + 1,
+           ${fcmColumn} = NULL,
+           updated_at = NOW()
+     WHERE id = $1
+     RETURNING ${versionColumn} AS new_version`,
     [user.id],
   );
-  user.token_version = versionResult.rows[0].token_version;
+  user[versionColumn] = versionResult.rows[0].new_version;
 
-  console.log(`[FORCE_LOGOUT] Invalidated old sessions for user ${user.id}`);
+  console.log(
+    `[FORCE_LOGOUT] Invalidated ${appConfig.app} session for user ${user.id}`,
+  );
 
   // ── Generate tokens with role from app config, not DB ──────
   const tokens = await generateTokens(user, appConfig);
@@ -375,9 +426,12 @@ const verifyToken = async (authHeader) => {
   const decoded = jwt.verify(token, secret);
 
   // Check token_version matches DB — rejects tokens issued before ban/unban
+  // or before a per-app force-logout. Picks the per-app column from the JWT's
+  // `app` claim. Ancient JWTs without `app` fall back to legacy single column.
   const db = await getPool();
   const result = await db.query(
-    `SELECT token_version, account_status, ban_reason FROM "user" WHERE id = $1`,
+    `SELECT token_version, mentor_token_version, mentee_token_version, account_status, ban_reason
+     FROM "user" WHERE id = $1`,
     [decoded.sub],
   );
 
@@ -391,9 +445,18 @@ const verifyToken = async (authHeader) => {
     throw new Error("Account banned");
   }
 
+  let dbVersion;
+  if (decoded.app === "mentor") {
+    dbVersion = user.mentor_token_version;
+  } else if (decoded.app === "mentee") {
+    dbVersion = user.mentee_token_version;
+  } else {
+    dbVersion = user.token_version;
+  }
+
   if (
     decoded.token_version !== undefined &&
-    decoded.token_version !== user.token_version
+    decoded.token_version !== dbVersion
   ) {
     throw new Error("Token revoked");
   }
@@ -415,13 +478,17 @@ const handlers = {
       last_name,
     } = body;
 
+    const testAccount = phone_number ? TEST_ACCOUNTS[phone_number] : null;
     if (
       process.env.ENABLE_TEST_ACCOUNT === "true" &&
-      phone_number === TEST_PHONE_NUMBER
+      testAccount &&
+      testAccount.apps.includes(appConfig.app)
     ) {
-      console.log("[TEST ACCOUNT] Bypassing Truecaller for test phone number");
+      console.log(
+        `[TEST ACCOUNT] Bypassing Truecaller for ${phone_number} on ${appConfig.app} app`,
+      );
       return findOrCreateUserAndRespond(
-        TEST_PHONE_NUMBER,
+        phone_number,
         "Play Store",
         "Reviewer",
         false,
@@ -716,11 +783,23 @@ const handlers = {
       .digest("hex");
     const db = await getPool();
 
-    // Find and validate refresh token
+    // Find and validate refresh token. Explicit columns to avoid the rt.id /
+    // u.id collision that `SELECT rt.*, u.*` produced previously.
     const result = await db.query(
-      `SELECT rt.*, u.* FROM refresh_token rt
+      `SELECT
+         rt.app                  AS rt_app,
+         u.id                    AS user_id,
+         u.registered_as,
+         u.account_status,
+         u.ban_reason,
+         u.token_version,
+         u.mentor_token_version,
+         u.mentee_token_version
+       FROM refresh_token rt
        JOIN "user" u ON rt.user_id = u.id
-       WHERE rt.token_hash = $1 AND rt.revoked_at IS NULL AND rt.expires_at > NOW()`,
+       WHERE rt.token_hash = $1
+         AND rt.revoked_at IS NULL
+         AND rt.expires_at > NOW()`,
       [tokenHash],
     );
 
@@ -732,6 +811,18 @@ const handlers = {
     }
 
     const row = result.rows[0];
+
+    // Per-app refresh binding: a refresh token issued to one app cannot be
+    // used to mint access tokens for the other. NULL rt_app is a row from
+    // before the v016 migration — accepted during the rollout window. The
+    // INSERT inside generateTokens below will produce a new row with `app`
+    // set, and we revoke this NULL row, so the NULL state self-heals.
+    if (row.rt_app !== null && row.rt_app !== appConfig.app) {
+      return {
+        statusCode: 401,
+        body: { error: "Refresh token not valid for this app" },
+      };
+    }
 
     // Check if user is banned
     if (row.account_status === "banned") {
@@ -752,11 +843,14 @@ const handlers = {
       [tokenHash],
     );
 
-    // Generate new tokens
+    // Generate new tokens. Pass the per-app columns through so generateTokens
+    // can pick the right one based on appConfig.app (with legacy fallback).
     const user = {
       id: row.user_id,
       registered_as: row.registered_as,
       token_version: row.token_version,
+      mentor_token_version: row.mentor_token_version,
+      mentee_token_version: row.mentee_token_version,
     };
     const tokens = await generateTokens(user, appConfig);
 
@@ -875,13 +969,19 @@ const handlers = {
     const deletionDate = new Date();
     deletionDate.setDate(deletionDate.getDate() + 30);
 
-    // Update user status
+    // Update user status. Account deletion is global — bump both per-app
+    // token_versions and clear both per-app FCM columns so neither app can
+    // continue against this account.
     await db.query(
       `UPDATE "user"
        SET account_status = 'soft_deleted',
            deletion_scheduled_at = $2,
            token_version = token_version + 1,
+           mentor_token_version = mentor_token_version + 1,
+           mentee_token_version = mentee_token_version + 1,
            fcm_token = NULL,
+           mentor_fcm_token = NULL,
+           mentee_fcm_token = NULL,
            updated_at = NOW()
        WHERE id = $1`,
       [userId, deletionDate.toISOString()]
@@ -947,21 +1047,38 @@ const handlers = {
     }
 
     const userId = decoded.sub;
+    const app = decoded.app;
+    if (app !== "mentor" && app !== "mentee") {
+      return { statusCode: 400, body: { error: "Invalid app context" } };
+    }
+    const fcmColumn =
+      app === "mentor" ? "mentor_fcm_token" : "mentee_fcm_token";
+
     const db = await getPool();
 
-    // Clear this FCM token from any other user (token can only belong to one device/user)
+    // Clear this FCM token from the per-app column on any other user, and
+    // also from the legacy column. Single-device-per-app for the per-app
+    // column; the legacy clear keeps un-updated fcmHelper copies from
+    // pushing to a token that's no longer valid for anyone.
+    await db.query(
+      `UPDATE "user" SET ${fcmColumn} = NULL WHERE ${fcmColumn} = $1 AND id != $2`,
+      [fcm_token, userId],
+    );
     await db.query(
       `UPDATE "user" SET fcm_token = NULL WHERE fcm_token = $1 AND id != $2`,
       [fcm_token, userId],
     );
 
-    // Set token for this user
-    await db.query(`UPDATE "user" SET fcm_token = $2 WHERE id = $1`, [
-      userId,
-      fcm_token,
-    ]);
+    // Set token on this user. Dual-write the legacy column so other lambdas
+    // whose fcmHelper still reads it during the rollout window push to the
+    // most recently registered device for this user (matches today's
+    // behaviour). The post-migration helper reads ${app}_fcm_token instead.
+    await db.query(
+      `UPDATE "user" SET ${fcmColumn} = $2, fcm_token = $2 WHERE id = $1`,
+      [userId, fcm_token],
+    );
 
-    console.log(`FCM token stored for user ${userId}`);
+    console.log(`FCM token stored for user ${userId} (${app})`);
 
     return { statusCode: 200, body: { message: "FCM token registered" } };
   },
