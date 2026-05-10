@@ -698,7 +698,7 @@ if (languages.length > 0) {
  */
 async function getCategories(db, userId) {
   const allCats = await db.query(
-    `SELECT id, name FROM mentorship_category ORDER BY name`
+    `SELECT id, name FROM mentorship_category WHERE is_active = TRUE ORDER BY sort_order NULLS LAST, name`
   );
 
   const menteeCats = await db.query(
@@ -819,7 +819,7 @@ async function getMentorProfile(db, userId, queryParams, menteeIntroPromo = { el
      FROM user_mentorship um
      JOIN mentorship_category mc ON mc.id = um.mentorship_category_id
      WHERE um.user_id = $1 AND um.role = 'mentor'
-     ORDER BY mc.name`,
+     ORDER BY mc.sort_order NULLS LAST, mc.name`,
     [mentorId]
   );
   const categories = catResult.rows.map((r) => r.name);
