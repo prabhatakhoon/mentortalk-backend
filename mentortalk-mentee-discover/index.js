@@ -421,7 +421,7 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
             AND s.status = 'completed'
          ) AS total_sessions,
 
-         (SELECT ARRAY_AGG(mc.name ORDER BY mc.name)
+         (SELECT ARRAY_AGG(mc.name ORDER BY mc.sort_order NULLS LAST, mc.name)
           FROM user_mentorship um2
           JOIN mentorship_category mc ON mc.id = um2.mentorship_category_id
           WHERE um2.user_id = mm.mentor_id AND um2.role = 'mentor'
@@ -624,7 +624,7 @@ if (languages.length > 0) {
        ) AS total_sessions,
 
        -- All categories for this mentor
-       (SELECT ARRAY_AGG(mc.name ORDER BY mc.name)
+       (SELECT ARRAY_AGG(mc.name ORDER BY mc.sort_order NULLS LAST, mc.name)
         FROM user_mentorship um2
         JOIN mentorship_category mc ON mc.id = um2.mentorship_category_id
         WHERE um2.user_id = u.id AND um2.role = 'mentor'
@@ -1013,7 +1013,7 @@ async function getFollowing(db, userId, queryParams, menteeIntroPromo = { eligib
        COALESCE(mp.avg_rating, 0) AS avg_rating,
        COALESCE(mp.total_reviews, 0) AS total_reviews,
        (SELECT COUNT(*) FROM session s WHERE s.mentor_id = f.mentor_id AND s.status = 'completed') AS total_sessions,
-     (SELECT ARRAY_AGG(mc.name ORDER BY mc.name)
+     (SELECT ARRAY_AGG(mc.name ORDER BY mc.sort_order NULLS LAST, mc.name)
         FROM user_mentorship um
         JOIN mentorship_category mc ON mc.id = um.mentorship_category_id
         WHERE um.user_id = f.mentor_id AND um.role = 'mentor'
