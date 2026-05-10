@@ -23,8 +23,11 @@
  * Additional query params (search-mentors only):
  *   q          — search query (name, ILIKE)
  *
- * NOTE: All discover endpoints enforce is_available = true so only
- *       mentors who have opted-in appear in results.
+ * NOTE: All discover endpoints enforce two flags on mentor_profile:
+ *         - is_available = TRUE (mentor self-toggle, "open for sessions")
+ *         - is_listed    = TRUE (admin toggle, marketplace visibility)
+ *       Both must be true for a mentor to surface to mentees. Direct
+ *       profile fetch returns 404 when is_listed = FALSE.
  *
  * Popularity score = 0.6 × (avg_rating / 5.0) + 0.4 × (sessions / max_sessions)
  *
@@ -397,6 +400,7 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
        JOIN "user" u ON u.id = mp2.user_id
        WHERE u.account_status = 'active'
          AND u.is_test_account = ${callerIsTest ? 'TRUE' : 'FALSE'}
+         AND mp2.is_listed = true
          AND EXISTS (SELECT 1 FROM mentorship_application ma WHERE ma.user_id = mp2.user_id AND ma.submission_status = 'approved')
          ${catIds ? `AND EXISTS (SELECT 1 FROM user_mentorship um WHERE um.user_id = mp2.user_id AND um.role = 'mentor' AND um.mentorship_category_id IN (SELECT cat_id FROM mentee_cats))` : ''}
          ${blockedCondition}
@@ -438,6 +442,7 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
        JOIN "user" u ON u.id = mm.mentor_id
        JOIN mentor_profile mp ON mp.user_id = mm.mentor_id
        WHERE mp.is_available = true
+         AND mp.is_listed = true
          ${type === 'audio_call' ? 'AND mp.pref_audio = true' : ''}
          ${genderCondition}
          ${languageCondition}
@@ -549,6 +554,7 @@ async function searchMentors(db, queryParams, blockedIds = [], menteeIntroPromo 
     `u.account_status = 'active'`,
     `u.is_test_account = ${callerIsTest ? 'TRUE' : 'FALSE'}`,
     `EXISTS (SELECT 1 FROM mentorship_application ma WHERE ma.user_id = u.id AND ma.submission_status = 'approved')`,
+    `mp.is_listed = true`,
   ];
   const joins = [`JOIN mentor_profile mp ON mp.user_id = u.id`];
   const params = [];
@@ -795,7 +801,9 @@ async function getMentorProfile(db, userId, queryParams, menteeIntroPromo = { el
 
      FROM "user" u
      JOIN mentor_profile mp ON mp.user_id = u.id
-     WHERE u.id = $1`,
+     WHERE u.id = $1
+       AND mp.is_listed = true
+       AND u.account_status = 'active'`,
     [mentorId, userId]
   );
 
@@ -1035,6 +1043,7 @@ async function getFollowing(db, userId, queryParams, menteeIntroPromo = { eligib
     WHERE f.mentee_id = $1
        AND u.account_status = 'active'
        AND u.is_test_account = ${callerIsTest ? 'TRUE' : 'FALSE'}
+       AND mp.is_listed = true
      ORDER BY f.created_at DESC
      LIMIT $2 OFFSET $3`,
     [userId, limit, offset]
