@@ -1904,6 +1904,7 @@ async function handleFreeChat(menteeId, event) {
      WHERE u.account_status = 'active'
        AND ma.submission_status = 'approved'
        AND mp.is_available = TRUE
+       AND mp.is_listed = TRUE
        AND mp.free_chat_enabled = TRUE
        AND u.is_test_account = $4
        AND EXISTS (
@@ -2096,6 +2097,7 @@ async function handleFreeChatAvailability(menteeId, event) {
      WHERE u.account_status = 'active'
        AND ma.submission_status = 'approved'
        AND mp.is_available = TRUE
+       AND mp.is_listed = TRUE
        AND mp.free_chat_enabled = TRUE
        AND um.mentorship_category_id = ANY($1)
        AND NOT EXISTS (
