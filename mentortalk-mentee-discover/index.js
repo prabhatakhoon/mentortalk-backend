@@ -190,6 +190,7 @@ async function formatMentorRow(row) {
         display_name: displayName || row.first_name || "Mentor",
         profile_photo_url: photoUrl,
         categories,
+        institution_name: row.institution_name || null,
         rating: parseFloat(Number(row.avg_rating).toFixed(1)),
         total_sessions: parseInt(row.total_sessions),
         rate_per_minute: parseInt(row.rate_per_minute),
@@ -424,7 +425,14 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
           FROM user_mentorship um2
           JOIN mentorship_category mc ON mc.id = um2.mentorship_category_id
           WHERE um2.user_id = mm.mentor_id AND um2.role = 'mentor'
-         ) AS categories
+         ) AS categories,
+
+         (SELECT e.institution_name
+          FROM education e
+          WHERE e.user_id = mm.mentor_id AND e.role = 'mentor'
+          ORDER BY e.end_year DESC NULLS FIRST, e.start_year DESC NULLS LAST
+          LIMIT 1
+         ) AS institution_name
 
        FROM matching_mentors mm
        JOIN "user" u ON u.id = mm.mentor_id
@@ -451,6 +459,7 @@ async function getPopularMentors(db, userId, queryParams, blockedIds = [], mente
        last_name,
        profile_photo_url,
        categories,
+       institution_name,
        avg_rating,
        total_sessions,
        rate_per_minute,
@@ -620,6 +629,13 @@ if (languages.length > 0) {
         JOIN mentorship_category mc ON mc.id = um2.mentorship_category_id
         WHERE um2.user_id = u.id AND um2.role = 'mentor'
        ) AS categories,
+
+       (SELECT e.institution_name
+        FROM education e
+        WHERE e.user_id = u.id AND e.role = 'mentor'
+        ORDER BY e.end_year DESC NULLS FIRST, e.start_year DESC NULLS LAST
+        LIMIT 1
+       ) AS institution_name,
 
        COUNT(*) OVER() AS total_count
 
@@ -1002,6 +1018,12 @@ async function getFollowing(db, userId, queryParams, menteeIntroPromo = { eligib
         JOIN mentorship_category mc ON mc.id = um.mentorship_category_id
         WHERE um.user_id = f.mentor_id AND um.role = 'mentor'
        ) AS categories,
+       (SELECT e.institution_name
+        FROM education e
+        WHERE e.user_id = f.mentor_id AND e.role = 'mentor'
+        ORDER BY e.end_year DESC NULLS FIRST, e.start_year DESC NULLS LAST
+        LIMIT 1
+       ) AS institution_name,
        EXISTS(
          SELECT 1 FROM identity_verification iv
          WHERE iv.user_id = f.mentor_id AND iv.aadhaar_verified = true
