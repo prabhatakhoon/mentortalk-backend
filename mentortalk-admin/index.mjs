@@ -1111,6 +1111,120 @@ const handlers = {
   },
 
   // ──────────────────────────────────────────────────────────
+  // POST /admin/users/:id/unlist
+  //
+  // Hides a mentor from mentee discovery (popular, list, search,
+  // following, direct profile fetch) and from free-chat candidate
+  // selection. Distinct from a ban: the mentor's own app, sessions in
+  // flight, and JWT remain untouched. Reversible via /relist.
+  //
+  // Body: { reviewer_id, reason } — both required
+  // Audit: admin_action_log action='mentor_unlisted'
+  // ──────────────────────────────────────────────────────────
+  unlistMentor: async (userId, body) => {
+    const reviewerId = body.reviewer_id;
+    const reason = (body.reason || "").trim();
+
+    if (!reviewerId) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    if (!reason) {
+      return {
+        statusCode: 400,
+        body: { error: "reason is required for the audit trail" },
+      };
+    }
+
+    const db = await getPool();
+
+    const mp = await db.query(
+      `SELECT user_id, is_listed FROM mentor_profile WHERE user_id = $1`,
+      [userId],
+    );
+    if (mp.rows.length === 0) {
+      return { statusCode: 404, body: { error: "Mentor profile not found" } };
+    }
+    if (mp.rows[0].is_listed === false) {
+      return { statusCode: 400, body: { error: "Mentor is already unlisted" } };
+    }
+
+    await db.query(
+      `UPDATE mentor_profile
+       SET is_listed = FALSE,
+           unlisted_at = NOW(),
+           unlisted_by = $2,
+           unlisted_reason = $3,
+           updated_at = NOW()
+       WHERE user_id = $1`,
+      [userId, reviewerId, reason],
+    );
+
+    await db.query(
+      `INSERT INTO admin_action_log (admin_id, target_user_id, action, reason)
+       VALUES ($1, $2, 'mentor_unlisted', $3)`,
+      [reviewerId, userId, reason],
+    );
+
+    return {
+      statusCode: 200,
+      body: { message: "Mentor unlisted", user_id: userId },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // POST /admin/users/:id/relist
+  //
+  // Restores a mentor to mentee discovery and free-chat eligibility.
+  // Clears all unlist audit columns on mentor_profile.
+  //
+  // Body: { reviewer_id, reason? }
+  // Audit: admin_action_log action='mentor_relisted'
+  // ──────────────────────────────────────────────────────────
+  relistMentor: async (userId, body) => {
+    const reviewerId = body.reviewer_id;
+    const reason = (body.reason || "").trim() || null;
+
+    if (!reviewerId) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+
+    const db = await getPool();
+
+    const mp = await db.query(
+      `SELECT user_id, is_listed FROM mentor_profile WHERE user_id = $1`,
+      [userId],
+    );
+    if (mp.rows.length === 0) {
+      return { statusCode: 404, body: { error: "Mentor profile not found" } };
+    }
+    if (mp.rows[0].is_listed === true) {
+      return { statusCode: 400, body: { error: "Mentor is already listed" } };
+    }
+
+    await db.query(
+      `UPDATE mentor_profile
+       SET is_listed = TRUE,
+           unlisted_at = NULL,
+           unlisted_by = NULL,
+           unlisted_reason = NULL,
+           updated_at = NOW()
+       WHERE user_id = $1`,
+      [userId],
+    );
+
+    await db.query(
+      `INSERT INTO admin_action_log (admin_id, target_user_id, action, reason)
+       VALUES ($1, $2, 'mentor_relisted', $3)`,
+      [reviewerId, userId, reason],
+    );
+
+    return {
+      statusCode: 200,
+      body: { message: "Mentor relisted", user_id: userId },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
   // DELETE /admin/users/:userId/education/:educationId
   //
   // Removes a single education row owned by the target user (mentor or
@@ -4049,6 +4163,20 @@ export const handler = async (event) => {
     );
     if (seedWalletMatch && method === "POST") {
       result = await handlers.seedTestWallet(seedWalletMatch[1], body);
+      return respond(result);
+    }
+
+    // POST /admin/users/:id/unlist
+    const unlistMatch = path.match(/\/admin\/users\/([\w-]+)\/unlist$/);
+    if (unlistMatch && method === "POST") {
+      result = await handlers.unlistMentor(unlistMatch[1], body);
+      return respond(result);
+    }
+
+    // POST /admin/users/:id/relist
+    const relistMatch = path.match(/\/admin\/users\/([\w-]+)\/relist$/);
+    if (relistMatch && method === "POST") {
+      result = await handlers.relistMentor(relistMatch[1], body);
       return respond(result);
     }
 
