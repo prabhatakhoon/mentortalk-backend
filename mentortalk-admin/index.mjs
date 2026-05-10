@@ -1111,6 +1111,91 @@ const handlers = {
   },
 
   // ──────────────────────────────────────────────────────────
+  // DELETE /admin/users/:userId/education/:educationId
+  //
+  // Removes a single education row owned by the target user (mentor or
+  // mentee) and the associated S3 document, if any. Used by admins to
+  // clean up duplicate entries mentors have submitted during onboarding.
+  //
+  // Unlike the mentor-self delete in mentortalk-onboarding, this handler
+  // does NOT roll back mentorship_application.step2_status when the last
+  // education row is removed — the application may already be approved
+  // or under review, and an admin removing a duplicate shouldn't bounce
+  // it back into in_progress.
+  //
+  // Body: { reviewer_id, reason }
+  // Response: { message, education_id }
+  // Audit: admin_action_log action='mentor_education_deleted'
+  // ──────────────────────────────────────────────────────────
+  deleteMentorEducation: async (userId, educationId, body) => {
+    const reviewerId = body.reviewer_id;
+    const reason = (body.reason || "").trim();
+
+    if (!reviewerId) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    if (!reason) {
+      return {
+        statusCode: 400,
+        body: { error: "reason is required for the audit trail" },
+      };
+    }
+
+    const db = await getPool();
+
+    const eduRes = await db.query(
+      `SELECT id, document_url, institution_name, degree, role
+       FROM education
+       WHERE id = $1 AND user_id = $2`,
+      [educationId, userId],
+    );
+    if (eduRes.rows.length === 0) {
+      return { statusCode: 404, body: { error: "Education entry not found" } };
+    }
+    const edu = eduRes.rows[0];
+
+    if (edu.document_url) {
+      try {
+        await s3Client.send(
+          new DeleteObjectCommand({
+            Bucket: BUCKET_NAME,
+            Key: edu.document_url,
+          }),
+        );
+      } catch (e) {
+        console.error("S3 delete error (education doc):", e);
+      }
+    }
+
+    await db.query(
+      `DELETE FROM education WHERE id = $1 AND user_id = $2`,
+      [educationId, userId],
+    );
+
+    await db.query(
+      `INSERT INTO admin_action_log (admin_id, target_user_id, action, reason, metadata)
+       VALUES ($1, $2, 'mentor_education_deleted', $3, $4)`,
+      [
+        reviewerId,
+        userId,
+        reason,
+        JSON.stringify({
+          education_id: edu.id,
+          institution_name: edu.institution_name,
+          degree: edu.degree,
+          document_url: edu.document_url,
+          role: edu.role,
+        }),
+      ],
+    );
+
+    return {
+      statusCode: 200,
+      body: { message: "Education entry deleted", education_id: edu.id },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
   // GET /admin/reports?status=pending
   // ──────────────────────────────────────────────────────────
   getReports: async (queryParams) => {
@@ -3964,6 +4049,19 @@ export const handler = async (event) => {
     );
     if (seedWalletMatch && method === "POST") {
       result = await handlers.seedTestWallet(seedWalletMatch[1], body);
+      return respond(result);
+    }
+
+    // DELETE /admin/users/:userId/education/:educationId
+    const eduDeleteMatch = path.match(
+      /\/admin\/users\/([\w-]+)\/education\/([\w-]+)$/,
+    );
+    if (eduDeleteMatch && method === "DELETE") {
+      result = await handlers.deleteMentorEducation(
+        eduDeleteMatch[1],
+        eduDeleteMatch[2],
+        body,
+      );
       return respond(result);
     }
 
