@@ -783,13 +783,29 @@ const handlers = {
   },
 
   // POST /onboarding/education/presign
+  //
+  // Accepts the same union as aadhaarPresign — PDFs and common image
+  // formats — so mentors can upload either a scanned certificate or a
+  // photo of one. content_type is required and validated against the
+  // whitelist; ContentType is signed into the URL so the client must
+  // PUT with the exact same header.
   educationPresign: async (userId, body) => {
-    const { file_name } = body;
-    const s3Key = `education/${userId}/${Date.now()}-${file_name || "document.pdf"}`;
+    const { file_name, content_type } = body;
+    const ALLOWED_TYPES = ["application/pdf", "image/jpeg", "image/png"];
+    if (!ALLOWED_TYPES.includes(content_type)) {
+      return {
+        statusCode: 400,
+        body: { error: "Unsupported file type. Allowed: PDF, JPG, PNG." },
+      };
+    }
+    const fallbackName =
+      content_type === "application/pdf" ? "document.pdf" : "document";
+    const safeName = file_name || fallbackName;
+    const s3Key = `education/${userId}/${Date.now()}-${safeName}`;
     const command = new PutObjectCommand({
       Bucket: BUCKET_NAME,
       Key: s3Key,
-      ContentType: "application/pdf",
+      ContentType: content_type,
     });
     const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 });
 
