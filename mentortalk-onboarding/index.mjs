@@ -199,7 +199,7 @@ const handlers = {
        ORDER BY created_at DESC LIMIT 1`,
       [appData.id],
     );
-    console.log(latestReview.rows[0].comments);
+
     const adminComments = latestReview.rows[0]?.comments
       ? typeof latestReview.rows[0].comments === "string"
         ? JSON.parse(latestReview.rows[0].comments)
