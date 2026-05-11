@@ -1310,6 +1310,125 @@ const handlers = {
   },
 
   // ──────────────────────────────────────────────────────────
+  // PUT /admin/users/:userId/education/:educationId
+  //
+  // Lets admins correct typos in free-text fields a mentor entered during
+  // onboarding (institution name, degree, field of study, years). The
+  // certificate (document_url) is intentionally NOT editable — if it's
+  // wrong, delete the row and ask the mentor to re-upload.
+  //
+  // Body: { reviewer_id, reason, institution_name, degree, field_of_study?, start_year?, end_year? }
+  // Response: { message, education_id }
+  // Audit: admin_action_log action='mentor_education_updated', metadata
+  //        carries before+after snapshots so the change is reviewable.
+  // ──────────────────────────────────────────────────────────
+  updateMentorEducation: async (userId, educationId, body) => {
+    const reviewerId = body.reviewer_id;
+    const reason = (body.reason || "").trim();
+    const institutionName = (body.institution_name || "").trim();
+    const degree = (body.degree || "").trim();
+    const fieldOfStudy = body.field_of_study
+      ? String(body.field_of_study).trim()
+      : null;
+    const startYear =
+      body.start_year !== undefined && body.start_year !== null
+        ? Number(body.start_year)
+        : null;
+    const endYear =
+      body.end_year !== undefined && body.end_year !== null
+        ? Number(body.end_year)
+        : null;
+
+    if (!reviewerId) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    if (!reason) {
+      return {
+        statusCode: 400,
+        body: { error: "reason is required for the audit trail" },
+      };
+    }
+    if (!institutionName) {
+      return {
+        statusCode: 400,
+        body: { error: "institution_name is required" },
+      };
+    }
+    if (!degree) {
+      return { statusCode: 400, body: { error: "degree is required" } };
+    }
+    if (startYear !== null && (!Number.isInteger(startYear) || startYear < 1900 || startYear > 2100)) {
+      return { statusCode: 400, body: { error: "start_year is invalid" } };
+    }
+    if (endYear !== null && (!Number.isInteger(endYear) || endYear < 1900 || endYear > 2100)) {
+      return { statusCode: 400, body: { error: "end_year is invalid" } };
+    }
+    if (startYear !== null && endYear !== null && endYear < startYear) {
+      return {
+        statusCode: 400,
+        body: { error: "end_year cannot be before start_year" },
+      };
+    }
+
+    const db = await getPool();
+
+    const eduRes = await db.query(
+      `SELECT id, institution_name, degree, field_of_study, start_year, end_year, role
+       FROM education
+       WHERE id = $1 AND user_id = $2`,
+      [educationId, userId],
+    );
+    if (eduRes.rows.length === 0) {
+      return { statusCode: 404, body: { error: "Education entry not found" } };
+    }
+    const before = eduRes.rows[0];
+
+    await db.query(
+      `UPDATE education
+       SET institution_name = $1,
+           degree           = $2,
+           field_of_study   = $3,
+           start_year       = $4,
+           end_year         = $5
+       WHERE id = $6 AND user_id = $7`,
+      [institutionName, degree, fieldOfStudy, startYear, endYear, educationId, userId],
+    );
+
+    await db.query(
+      `INSERT INTO admin_action_log (admin_id, target_user_id, action, reason, metadata)
+       VALUES ($1, $2, 'mentor_education_updated', $3, $4)`,
+      [
+        reviewerId,
+        userId,
+        reason,
+        JSON.stringify({
+          education_id: before.id,
+          role: before.role,
+          before: {
+            institution_name: before.institution_name,
+            degree: before.degree,
+            field_of_study: before.field_of_study,
+            start_year: before.start_year,
+            end_year: before.end_year,
+          },
+          after: {
+            institution_name: institutionName,
+            degree,
+            field_of_study: fieldOfStudy,
+            start_year: startYear,
+            end_year: endYear,
+          },
+        }),
+      ],
+    );
+
+    return {
+      statusCode: 200,
+      body: { message: "Education entry updated", education_id: before.id },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
   // GET /admin/reports?status=pending
   // ──────────────────────────────────────────────────────────
   getReports: async (queryParams) => {
@@ -4181,13 +4300,22 @@ export const handler = async (event) => {
     }
 
     // DELETE /admin/users/:userId/education/:educationId
-    const eduDeleteMatch = path.match(
+    // PUT    /admin/users/:userId/education/:educationId
+    const eduMatch = path.match(
       /\/admin\/users\/([\w-]+)\/education\/([\w-]+)$/,
     );
-    if (eduDeleteMatch && method === "DELETE") {
+    if (eduMatch && method === "DELETE") {
       result = await handlers.deleteMentorEducation(
-        eduDeleteMatch[1],
-        eduDeleteMatch[2],
+        eduMatch[1],
+        eduMatch[2],
+        body,
+      );
+      return respond(result);
+    }
+    if (eduMatch && method === "PUT") {
+      result = await handlers.updateMentorEducation(
+        eduMatch[1],
+        eduMatch[2],
         body,
       );
       return respond(result);
