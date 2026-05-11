@@ -1,5 +1,13 @@
-import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
-import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import {
+  SecretsManagerClient,
+  GetSecretValueCommand,
+} from "@aws-sdk/client-secrets-manager";
+import {
+  S3Client,
+  PutObjectCommand,
+  DeleteObjectCommand,
+  GetObjectCommand,
+} from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import pg from "pg";
 import jwt from "jsonwebtoken";
@@ -14,7 +22,7 @@ let jwtSecret = null;
 
 const getDbCredentials = async () => {
   const response = await secretsClient.send(
-    new GetSecretValueCommand({ SecretId: "mentortalk/db-app-credentials" })
+    new GetSecretValueCommand({ SecretId: "mentortalk/db-app-credentials" }),
   );
   return JSON.parse(response.SecretString);
 };
@@ -22,7 +30,7 @@ const getDbCredentials = async () => {
 const getJwtSecret = async () => {
   if (jwtSecret) return jwtSecret;
   const response = await secretsClient.send(
-    new GetSecretValueCommand({ SecretId: "mentortalk/jwt-secret" })
+    new GetSecretValueCommand({ SecretId: "mentortalk/jwt-secret" }),
   );
   jwtSecret = JSON.parse(response.SecretString).secret;
   return jwtSecret;
@@ -59,7 +67,7 @@ const removeEditableSubstep = async (userId, substep) => {
      SET pending_fixes = array_remove(pending_fixes, $1)
      WHERE user_id = $2
      AND $1 = ANY(pending_fixes)`,
-    [substep, userId]
+    [substep, userId],
   );
 };
 
@@ -103,10 +111,12 @@ const exclusionFindViolations = (selectedIds, edgeSet, parentMap) => {
 const loadExclusionRule = async (db) => {
   const [exResult, optResult] = await Promise.all([
     db.query(`SELECT node_a, node_b FROM mentorship_exclusion`),
-    db.query(`SELECT id, category_id FROM mentorship_option WHERE is_active = true`),
+    db.query(
+      `SELECT id, category_id FROM mentorship_option WHERE is_active = true`,
+    ),
   ]);
   const edgeSet = new Set(
-    exResult.rows.map((r) => exclusionEdgeKey(r.node_a, r.node_b))
+    exResult.rows.map((r) => exclusionEdgeKey(r.node_a, r.node_b)),
   );
   const parentMap = {};
   for (const r of optResult.rows) parentMap[r.id] = r.category_id;
@@ -124,48 +134,57 @@ const handlers = {
   getStatus: async (userId) => {
     const db = await getPool();
 
-    const [app, identity, user, languages, mentorshipRows, education, experience] =
-      await Promise.all([
-        db.query(`SELECT * FROM mentorship_application WHERE user_id = $1`, [userId]),
-        db.query(
-          `SELECT aadhaar_file_url, aadhaar_verified, aadhaar_uploaded_at,
+    const [
+      app,
+      identity,
+      user,
+      languages,
+      mentorshipRows,
+      education,
+      experience,
+    ] = await Promise.all([
+      db.query(`SELECT * FROM mentorship_application WHERE user_id = $1`, [
+        userId,
+      ]),
+      db.query(
+        `SELECT aadhaar_file_url, aadhaar_verified, aadhaar_uploaded_at,
                   selfie_url, selfie_uploaded_at
            FROM identity_verification WHERE user_id = $1`,
-          [userId]
-        ),
-        db.query(
-          `SELECT mp.first_name, mp.last_name, u.dob, u.gender
+        [userId],
+      ),
+      db.query(
+        `SELECT mp.first_name, mp.last_name, u.dob, u.gender
            FROM "user" u
            LEFT JOIN mentor_profile mp ON mp.user_id = u.id
            WHERE u.id = $1`,
-          [userId]
-        ),
+        [userId],
+      ),
 
-        db.query(
-          `SELECT language_code FROM user_language WHERE user_id = $1 AND role = 'mentor'`,
-          [userId]
-        ),
-        db.query(
-          `SELECT mentorship_category_id, mentorship_option_id FROM user_mentorship WHERE user_id = $1 AND role = 'mentor'`,
-          [userId]
-        ),
-        db.query(
-          `SELECT id, institution_name, degree, field_of_study,
+      db.query(
+        `SELECT language_code FROM user_language WHERE user_id = $1 AND role = 'mentor'`,
+        [userId],
+      ),
+      db.query(
+        `SELECT mentorship_category_id, mentorship_option_id FROM user_mentorship WHERE user_id = $1 AND role = 'mentor'`,
+        [userId],
+      ),
+      db.query(
+        `SELECT id, institution_name, degree, field_of_study,
                   start_year, end_year, document_url, is_verified,
                   created_at, updated_at
            FROM education WHERE user_id = $1 AND role = 'mentor'
            ORDER BY start_year DESC NULLS LAST, created_at DESC`,
-          [userId]
-        ),
-        db.query(
-          `SELECT id, title, organization, is_current,
+        [userId],
+      ),
+      db.query(
+        `SELECT id, title, organization, is_current,
                   start_month, start_year, end_month, end_year,
                   description, is_verified, created_at, updated_at
            FROM experience WHERE user_id = $1
            ORDER BY is_current DESC, start_year DESC, start_month DESC`,
-          [userId]
-        ),
-      ]);
+        [userId],
+      ),
+    ]);
 
     if (app.rows.length === 0) {
       return { statusCode: 404, body: { error: "Application not found" } };
@@ -178,20 +197,23 @@ const handlers = {
       `SELECT comments FROM review_history 
        WHERE application_id = $1 AND comments IS NOT NULL
        ORDER BY created_at DESC LIMIT 1`,
-      [appData.id]
+      [appData.id],
     );
+    console.log(latestReview.rows[0].comments);
     const adminComments = latestReview.rows[0]?.comments
-      ? (typeof latestReview.rows[0].comments === 'string'
-         ? JSON.parse(latestReview.rows[0].comments)
-         : latestReview.rows[0].comments)
+      ? typeof latestReview.rows[0].comments === "string"
+        ? JSON.parse(latestReview.rows[0].comments)
+        : latestReview.rows[0].comments
       : {};
 
     const identityData = identity.rows[0] || {};
     const userData = user.rows[0] || {};
-    const selectedCategories = [...new Set(mentorshipRows.rows.map(r => r.mentorship_category_id))];
+    const selectedCategories = [
+      ...new Set(mentorshipRows.rows.map((r) => r.mentorship_category_id)),
+    ];
     const selectedOptions = mentorshipRows.rows
-      .filter(r => r.mentorship_option_id)
-      .map(r => r.mentorship_option_id);
+      .filter((r) => r.mentorship_option_id)
+      .map((r) => r.mentorship_option_id);
 
     const overallStatus =
       appData.submission_status ||
@@ -213,7 +235,10 @@ const handlers = {
 
     // Check personal details completeness
     const personalDetailsComplete =
-      !!userData.first_name && !!userData.last_name && !!userData.dob && !!userData.gender;
+      !!userData.first_name &&
+      !!userData.last_name &&
+      !!userData.dob &&
+      !!userData.gender;
 
     return {
       statusCode: 200,
@@ -233,7 +258,8 @@ const handlers = {
           is_complete: personalDetailsComplete && languages.rows.length > 0,
         },
         identity: {
-          aadhaar_uploaded: !!identityData.aadhaar_file_url || !!identityData.aadhaar_verified,
+          aadhaar_uploaded:
+            !!identityData.aadhaar_file_url || !!identityData.aadhaar_verified,
           aadhaar_verified: !!identityData.aadhaar_verified,
           aadhaar_file_url: identityData.aadhaar_file_url || null,
           selfie_url: selfieUrl,
@@ -274,15 +300,19 @@ const handlers = {
               reviewed_by: appData.reviewed_by || null,
             }
           : null,
-          rejection: appData.submission_status === 'rejected'
-          ? {
-              attempt_count: appData.attempt_number,
-              max_attempts: appData.max_attempts,
-              attempts_remaining: Math.max(0, appData.max_attempts - appData.attempt_number),
-              can_reapply: appData.attempt_number < appData.max_attempts,
-              cooldown_until: appData.cooldown_until || null,
-            }
-          : null,
+        rejection:
+          appData.submission_status === "rejected"
+            ? {
+                attempt_count: appData.attempt_number,
+                max_attempts: appData.max_attempts,
+                attempts_remaining: Math.max(
+                  0,
+                  appData.max_attempts - appData.attempt_number,
+                ),
+                can_reapply: appData.attempt_number < appData.max_attempts,
+                cooldown_until: appData.cooldown_until || null,
+              }
+            : null,
       },
     };
   },
@@ -294,10 +324,13 @@ const handlers = {
          FROM mentorship_application ma
          LEFT JOIN mentor_profile mp ON mp.user_id = ma.user_id
         WHERE ma.user_id = $1`,
-      [userId]
+      [userId],
     );
     if (result.rows.length === 0) {
-      return { statusCode: 200, body: { status: "new", rules_acknowledged_at: null } };
+      return {
+        statusCode: 200,
+        body: { status: "new", rules_acknowledged_at: null },
+      };
     }
     return {
       statusCode: 200,
@@ -327,12 +360,12 @@ const handlers = {
       return { statusCode: 400, body: { error: "Invalid gender value" } };
     }
 
-     // DOB + gender stay on user table
-     await db.query(
+    // DOB + gender stay on user table
+    await db.query(
       `UPDATE "user"
        SET dob = $1, gender = $2, updated_at = NOW()
        WHERE id = $3`,
-      [dob, gender, userId]
+      [dob, gender, userId],
     );
 
     // Names go to mentor_profile
@@ -340,19 +373,22 @@ const handlers = {
       `UPDATE mentor_profile
        SET first_name = $1, last_name = $2, updated_at = NOW()
        WHERE user_id = $3`,
-      [first_name.trim(), last_name.trim(), userId]
+      [first_name.trim(), last_name.trim(), userId],
     );
 
     // Replace languages
     if (Array.isArray(languages) && languages.length > 0) {
-      await db.query(`DELETE FROM user_language WHERE user_id = $1 AND role = 'mentor'`, [userId]);
+      await db.query(
+        `DELETE FROM user_language WHERE user_id = $1 AND role = 'mentor'`,
+        [userId],
+      );
       const values = languages
         .map((_, i) => `($1, $${i + 2}, 'mentor')`)
         .join(", ");
       const params = [userId, ...languages.map((l) => l.trim().toLowerCase())];
       await db.query(
         `INSERT INTO user_language (user_id, language_code, role) VALUES ${values}`,
-        params
+        params,
       );
     }
 
@@ -373,7 +409,9 @@ const handlers = {
         body: { error: "Unsupported file type. Allowed: PDF, JPG, PNG." },
       };
     }
-    const safeName = file_name || (content_type === "application/pdf" ? "aadhaar.pdf" : "aadhaar");
+    const safeName =
+      file_name ||
+      (content_type === "application/pdf" ? "aadhaar.pdf" : "aadhaar");
     const s3Key = `aadhaar/${userId}/${Date.now()}-${safeName}`;
     const command = new PutObjectCommand({
       Bucket: BUCKET_NAME,
@@ -405,7 +443,7 @@ const handlers = {
        VALUES ($1, $2, NOW())
        ON CONFLICT (user_id) DO UPDATE
        SET aadhaar_file_url = $2, aadhaar_uploaded_at = NOW(), updated_at = NOW()`,
-      [userId, s3_key]
+      [userId, s3_key],
     );
 
     await removeEditableSubstep(userId, "aadhaar");
@@ -439,7 +477,7 @@ const handlers = {
       `UPDATE identity_verification
        SET selfie_url = $1, selfie_uploaded_at = NOW(), updated_at = NOW()
        WHERE user_id = $2`,
-      [s3_key, userId]
+      [s3_key, userId],
     );
     await removeEditableSubstep(userId, "selfie");
 
@@ -458,26 +496,32 @@ const handlers = {
        FROM "user" u
        LEFT JOIN mentor_profile mp ON mp.user_id = u.id
        WHERE u.id = $1`,
-      [userId]
+      [userId],
     );
     const u = user.rows[0];
     if (!u || !u.first_name || !u.last_name || !u.dob || !u.gender) {
-      return { statusCode: 400, body: { error: "Personal details incomplete" } };
+      return {
+        statusCode: 400,
+        body: { error: "Personal details incomplete" },
+      };
     }
 
     // Verify languages
     const langs = await db.query(
       `SELECT COUNT(*) as count FROM user_language WHERE user_id = $1 AND role='mentor'`,
-      [userId]
+      [userId],
     );
     if (parseInt(langs.rows[0].count) === 0) {
-      return { statusCode: 400, body: { error: "At least one language required" } };
+      return {
+        statusCode: 400,
+        body: { error: "At least one language required" },
+      };
     }
 
     // Verify aadhaar uploaded
     const identity = await db.query(
       `SELECT aadhaar_file_url, selfie_url FROM identity_verification WHERE user_id = $1`,
-      [userId]
+      [userId],
     );
     if (identity.rows.length === 0 || !identity.rows[0].aadhaar_file_url) {
       return { statusCode: 400, body: { error: "Aadhaar not uploaded" } };
@@ -490,7 +534,7 @@ const handlers = {
       `UPDATE mentorship_application
        SET step1_status = 'done', step2_status = 'in_progress'
        WHERE user_id = $1`,
-      [userId]
+      [userId],
     );
 
     return { statusCode: 200, body: { message: "Step 1 complete" } };
@@ -503,31 +547,43 @@ const handlers = {
     const db = await getPool();
 
     const catResult = await db.query(
-      `SELECT * FROM mentorship_category WHERE is_active = true ORDER BY sort_order`
+      `SELECT * FROM mentorship_category WHERE is_active = true ORDER BY sort_order`,
     );
     const optResult = await db.query(
-      `SELECT * FROM mentorship_option WHERE is_active = true ORDER BY sort_order`
+      `SELECT * FROM mentorship_option WHERE is_active = true ORDER BY sort_order`,
     );
 
-    console.log('Cat count:', catResult.rows.length);
-    console.log('Opt count:', optResult.rows.length);
-    console.log('Sample cat id:', catResult.rows[0]?.id, typeof catResult.rows[0]?.id);
-    console.log('Sample opt category_id:', optResult.rows[0]?.category_id, typeof optResult.rows[0]?.category_id);
-    console.log('Filter test:', optResult.rows.filter(opt => opt.category_id === catResult.rows[0]?.id).length);
+    console.log("Cat count:", catResult.rows.length);
+    console.log("Opt count:", optResult.rows.length);
+    console.log(
+      "Sample cat id:",
+      catResult.rows[0]?.id,
+      typeof catResult.rows[0]?.id,
+    );
+    console.log(
+      "Sample opt category_id:",
+      optResult.rows[0]?.category_id,
+      typeof optResult.rows[0]?.category_id,
+    );
+    console.log(
+      "Filter test:",
+      optResult.rows.filter((opt) => opt.category_id === catResult.rows[0]?.id)
+        .length,
+    );
 
     const versionResult = await db.query(
-      `SELECT version FROM cache_metadata WHERE table_name = 'mentorship_category'`
+      `SELECT version FROM cache_metadata WHERE table_name = 'mentorship_category'`,
     );
 
     const exResult = await db.query(
-      `SELECT node_a, node_b FROM mentorship_exclusion`
+      `SELECT node_a, node_b FROM mentorship_exclusion`,
     );
 
     const categories = catResult.rows.map((cat) => ({
       id: cat.id,
       name: cat.name,
       options: optResult.rows
-      .filter((opt) => opt.category_id === cat.id)
+        .filter((opt) => opt.category_id === cat.id)
         .map((opt) => ({
           id: opt.id,
           name: opt.name,
@@ -557,7 +613,7 @@ const handlers = {
       `SELECT code, name, native_name, script 
        FROM language 
        WHERE is_active = true 
-       ORDER BY sort_order`
+       ORDER BY sort_order`,
     );
     return {
       statusCode: 200,
@@ -568,7 +624,7 @@ const handlers = {
   // ──────────────────────────────────────────────────────────
   // POST /onboarding/mentorship/categories
   // ──────────────────────────────────────────────────────────
-  saveCategories: async (userId, body, role = 'mentor') => {
+  saveCategories: async (userId, body, role = "mentor") => {
     const { selected_categories } = body;
     const db = await getPool();
 
@@ -577,7 +633,7 @@ const handlers = {
 
     // Authoritative validation: enforce mentor exclusion rules. Mentee role
     // is unaffected — exclusions don't constrain mentee category interest.
-    if (role === 'mentor') {
+    if (role === "mentor") {
       const { edgeSet, parentMap } = await loadExclusionRule(db);
       const violations = exclusionFindViolations(
         [...categoryIds, ...optionIds],
@@ -595,14 +651,17 @@ const handlers = {
       }
     }
 
-    await db.query(`DELETE FROM user_mentorship WHERE user_id = $1 AND role = $2`, [userId, role]);
+    await db.query(
+      `DELETE FROM user_mentorship WHERE user_id = $1 AND role = $2`,
+      [userId, role],
+    );
 
     // Look up each option's actual category from DB
     let optionToCategoryMap = {};
     if (optionIds.length > 0) {
       const optResult = await db.query(
         `SELECT id, category_id FROM mentorship_option WHERE id = ANY($1)`,
-        [optionIds]
+        [optionIds],
       );
       for (const row of optResult.rows) {
         optionToCategoryMap[row.id] = row.category_id;
@@ -613,7 +672,7 @@ const handlers = {
     for (const catId of categoryIds) {
       // Find options that belong to this category (from DB lookup)
       const catOptions = optionIds.filter(
-        optId => optionToCategoryMap[optId] === catId
+        (optId) => optionToCategoryMap[optId] === catId,
       );
 
       if (catOptions.length > 0) {
@@ -627,12 +686,12 @@ const handlers = {
 
     if (rows.length > 0) {
       const values = rows
-      .map((_, i) => `($1, $${i * 2 + 2}, $${i * 2 + 3}, '${role}')`)
-      .join(", ");
-      const params = [userId, ...rows.flatMap(r => [r.catId, r.optId])];
+        .map((_, i) => `($1, $${i * 2 + 2}, $${i * 2 + 3}, '${role}')`)
+        .join(", ");
+      const params = [userId, ...rows.flatMap((r) => [r.catId, r.optId])];
       await db.query(
         `INSERT INTO user_mentorship (user_id, mentorship_category_id, mentorship_option_id, role) VALUES ${values}`,
-        params
+        params,
       );
     }
 
@@ -645,7 +704,7 @@ const handlers = {
   // ──────────────────────────────────────────────────────────
 
   // GET /onboarding/education
-  getEducation: async (userId, role = 'mentor') => {
+  getEducation: async (userId, role = "mentor") => {
     const db = await getPool();
     const result = await db.query(
       `SELECT id, institution_name, degree, field_of_study,
@@ -653,7 +712,7 @@ const handlers = {
               created_at, updated_at
        FROM education WHERE user_id = $1 AND role = $2
        ORDER BY start_year DESC NULLS LAST, created_at DESC`,
-      [userId, role]
+      [userId, role],
     );
 
     return {
@@ -674,8 +733,15 @@ const handlers = {
   },
 
   // POST /onboarding/education
-  addEducation: async (userId, body, role = 'mentor') => {
-    const { institution_name, degree, field_of_study, start_year, end_year, document_url } = body;
+  addEducation: async (userId, body, role = "mentor") => {
+    const {
+      institution_name,
+      degree,
+      field_of_study,
+      start_year,
+      end_year,
+      document_url,
+    } = body;
     const db = await getPool();
 
     if (!institution_name || !degree) {
@@ -689,8 +755,17 @@ const handlers = {
       `INSERT INTO education (user_id, institution_name, degree, field_of_study, start_year, end_year, document_url, role)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING id`,
-       [userId, institution_name.trim(), degree.trim(), field_of_study?.trim() || null, start_year || null, end_year || null, document_url || null, role]
-     );
+      [
+        userId,
+        institution_name.trim(),
+        degree.trim(),
+        field_of_study?.trim() || null,
+        start_year || null,
+        end_year || null,
+        document_url || null,
+        role,
+      ],
+    );
 
     await removeEditableSubstep(userId, "education");
 
@@ -701,8 +776,15 @@ const handlers = {
   },
 
   // PUT /onboarding/education/:id
-  updateEducation: async (userId, educationId, body, role = 'mentor') => {
-    const { institution_name, degree, field_of_study, start_year, end_year, document_url } = body;
+  updateEducation: async (userId, educationId, body, role = "mentor") => {
+    const {
+      institution_name,
+      degree,
+      field_of_study,
+      start_year,
+      end_year,
+      document_url,
+    } = body;
     const db = await getPool();
 
     if (!institution_name || !degree) {
@@ -718,7 +800,17 @@ const handlers = {
            start_year = $4, end_year = $5, document_url = $6, updated_at = NOW()
        WHERE id = $7 AND user_id = $8 AND role = $9
        RETURNING id`,
-      [institution_name.trim(), degree.trim(), field_of_study?.trim() || null, start_year || null, end_year || null, document_url || null, educationId, userId, role]
+      [
+        institution_name.trim(),
+        degree.trim(),
+        field_of_study?.trim() || null,
+        start_year || null,
+        end_year || null,
+        document_url || null,
+        educationId,
+        userId,
+        role,
+      ],
     );
 
     if (result.rows.length === 0) {
@@ -729,13 +821,13 @@ const handlers = {
   },
 
   // DELETE /onboarding/education/:id
-  deleteEducation: async (userId, educationId, role = 'mentor') => {
+  deleteEducation: async (userId, educationId, role = "mentor") => {
     const db = await getPool();
 
     // Get document_url to delete from S3 if exists
     const edu = await db.query(
       `SELECT document_url FROM education WHERE id = $1 AND user_id = $2 AND role = $3`,
-      [educationId, userId, role]
+      [educationId, userId, role],
     );
 
     if (edu.rows.length === 0) {
@@ -749,32 +841,31 @@ const handlers = {
           new DeleteObjectCommand({
             Bucket: BUCKET_NAME,
             Key: edu.rows[0].document_url,
-          })
+          }),
         );
       } catch (e) {
         console.error("S3 delete error:", e);
       }
     }
 
-    await db.query(`DELETE FROM education WHERE id = $1 AND user_id = $2 AND role = $3`, [
-      educationId,
-      userId,
-      role,
-    ]);
+    await db.query(
+      `DELETE FROM education WHERE id = $1 AND user_id = $2 AND role = $3`,
+      [educationId, userId, role],
+    );
 
     // If this leaves the mentor with zero education entries, roll step2_status
     // back so the checklist no longer shows "done" with empty education.
-    if (role === 'mentor') {
+    if (role === "mentor") {
       const remaining = await db.query(
         `SELECT COUNT(*)::int AS count FROM education WHERE user_id = $1 AND role = 'mentor'`,
-        [userId]
+        [userId],
       );
       if (remaining.rows[0].count === 0) {
         await db.query(
           `UPDATE mentorship_application
            SET step2_status = 'in_progress', updated_at = NOW()
            WHERE user_id = $1 AND step2_status = 'done'`,
-          [userId]
+          [userId],
         );
       }
     }
@@ -830,7 +921,7 @@ const handlers = {
               description, is_verified, created_at, updated_at
        FROM experience WHERE user_id = $1
        ORDER BY is_current DESC, start_year DESC, start_month DESC`,
-      [userId]
+      [userId],
     );
 
     return {
@@ -854,13 +945,25 @@ const handlers = {
 
   // POST /onboarding/experience
   addExperience: async (userId, body) => {
-    const { title, organization, is_current, start_month, start_year, end_month, end_year, description } = body;
+    const {
+      title,
+      organization,
+      is_current,
+      start_month,
+      start_year,
+      end_month,
+      end_year,
+      description,
+    } = body;
     const db = await getPool();
 
     if (!title || !organization || !start_month || !start_year) {
       return {
         statusCode: 400,
-        body: { error: "title, organization, start_month, and start_year are required" },
+        body: {
+          error:
+            "title, organization, start_month, and start_year are required",
+        },
       };
     }
 
@@ -868,7 +971,17 @@ const handlers = {
       `INSERT INTO experience (user_id, title, organization, is_current, start_month, start_year, end_month, end_year, description)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING id`,
-      [userId, title.trim(), organization.trim(), is_current || false, start_month, start_year, end_month || null, end_year || null, description?.trim() || null]
+      [
+        userId,
+        title.trim(),
+        organization.trim(),
+        is_current || false,
+        start_month,
+        start_year,
+        end_month || null,
+        end_year || null,
+        description?.trim() || null,
+      ],
     );
 
     await removeEditableSubstep(userId, "experience");
@@ -881,13 +994,25 @@ const handlers = {
 
   // PUT /onboarding/experience/:id
   updateExperience: async (userId, experienceId, body) => {
-    const { title, organization, is_current, start_month, start_year, end_month, end_year, description } = body;
+    const {
+      title,
+      organization,
+      is_current,
+      start_month,
+      start_year,
+      end_month,
+      end_year,
+      description,
+    } = body;
     const db = await getPool();
 
     if (!title || !organization || !start_month || !start_year) {
       return {
         statusCode: 400,
-        body: { error: "title, organization, start_month, and start_year are required" },
+        body: {
+          error:
+            "title, organization, start_month, and start_year are required",
+        },
       };
     }
 
@@ -898,7 +1023,18 @@ const handlers = {
            end_year = $7, description = $8, updated_at = NOW()
        WHERE id = $9 AND user_id = $10
        RETURNING id`,
-      [title.trim(), organization.trim(), is_current || false, start_month, start_year, end_month || null, end_year || null, description?.trim() || null, experienceId, userId]
+      [
+        title.trim(),
+        organization.trim(),
+        is_current || false,
+        start_month,
+        start_year,
+        end_month || null,
+        end_year || null,
+        description?.trim() || null,
+        experienceId,
+        userId,
+      ],
     );
 
     if (result.rows.length === 0) {
@@ -914,7 +1050,7 @@ const handlers = {
 
     const result = await db.query(
       `DELETE FROM experience WHERE id = $1 AND user_id = $2 RETURNING id`,
-      [experienceId, userId]
+      [experienceId, userId],
     );
 
     if (result.rows.length === 0) {
@@ -933,7 +1069,7 @@ const handlers = {
 
     await db.query(
       `UPDATE mentorship_application SET notes = $1, updated_at = NOW() WHERE user_id = $2`,
-      [notes?.trim() || null, userId]
+      [notes?.trim() || null, userId],
     );
     await removeEditableSubstep(userId, "notes");
 
@@ -949,7 +1085,7 @@ const handlers = {
     // Verify categories selected
     const cats = await db.query(
       `SELECT COUNT(*) as count FROM user_mentorship WHERE user_id = $1 AND role = 'mentor'`,
-      [userId]
+      [userId],
     );
     if (parseInt(cats.rows[0].count) === 0) {
       return { statusCode: 400, body: { error: "Categories not selected" } };
@@ -958,15 +1094,18 @@ const handlers = {
     // Verify at least 1 education entry
     const edu = await db.query(
       `SELECT COUNT(*) as count FROM education WHERE user_id = $1 AND role = 'mentor'`,
-      [userId]
+      [userId],
     );
     if (parseInt(edu.rows[0].count) === 0) {
-      return { statusCode: 400, body: { error: "At least one education entry required" } };
+      return {
+        statusCode: 400,
+        body: { error: "At least one education entry required" },
+      };
     }
 
     await db.query(
       `UPDATE mentorship_application SET step2_status = 'done', updated_at = NOW() WHERE user_id = $1`,
-      [userId]
+      [userId],
     );
 
     return { statusCode: 200, body: { message: "Step 2 complete" } };
@@ -980,21 +1119,27 @@ const handlers = {
 
     const app = await db.query(
       `SELECT * FROM mentorship_application WHERE user_id = $1`,
-      [userId]
+      [userId],
     );
 
     if (app.rows.length === 0) {
       return { statusCode: 404, body: { error: "Application not found" } };
     }
 
-    if (app.rows[0].step1_status !== "done" || app.rows[0].step2_status !== "done") {
+    if (
+      app.rows[0].step1_status !== "done" ||
+      app.rows[0].step2_status !== "done"
+    ) {
       return { statusCode: 400, body: { error: "Complete all steps first" } };
     }
 
     const currentStatus = app.rows[0].submission_status;
 
     if (currentStatus === "under_review" || currentStatus === "approved") {
-      return { statusCode: 400, body: { error: "Cannot submit in current state" } };
+      return {
+        statusCode: 400,
+        body: { error: "Cannot submit in current state" },
+      };
     }
 
     if (currentStatus === "rejected" && app.rows[0].cooldown_until) {
@@ -1006,7 +1151,10 @@ const handlers = {
     if (currentStatus === "action_required") {
       const substeps = app.rows[0].pending_fixes || [];
       if (substeps.length > 0) {
-        return { statusCode: 400, body: { error: "Fix all flagged items first" } };
+        return {
+          statusCode: 400,
+          body: { error: "Fix all flagged items first" },
+        };
       }
     }
 
@@ -1017,7 +1165,7 @@ const handlers = {
            pending_fixes = '{}',
            updated_at = NOW()
        WHERE user_id = $1`,
-      [userId]
+      [userId],
     );
 
     return {
@@ -1034,10 +1182,10 @@ const handlers = {
   getDocumentTypes: async () => {
     const db = await getPool();
     const result = await db.query(
-      `SELECT * FROM document_type WHERE is_active = true ORDER BY sort_order`
+      `SELECT * FROM document_type WHERE is_active = true ORDER BY sort_order`,
     );
     const versionResult = await db.query(
-      `SELECT version FROM cache_metadata WHERE table_name = 'document_type'`
+      `SELECT version FROM cache_metadata WHERE table_name = 'document_type'`,
     );
 
     return {
@@ -1071,7 +1219,11 @@ export const handler = async (event) => {
       event.headers?.Authorization || event.headers?.authorization;
 
     // ── Public endpoints ──────────────────────────────────
-    if (path.includes("/categories") && method === "GET" && !path.includes("/mentorship/categories")) {
+    if (
+      path.includes("/categories") &&
+      method === "GET" &&
+      !path.includes("/mentorship/categories")
+    ) {
       const result = await handlers.getCategories();
       return respond(result);
     }
@@ -1089,50 +1241,58 @@ export const handler = async (event) => {
     // ── Protected endpoints ───────────────────────────────
     const decoded = await verifyToken(authHeader);
     const userId = decoded.sub;
-    const role = decoded.app || 'mentor';
+    const role = decoded.app || "mentor";
 
     let result;
 
     // Status
     if (path.includes("/submission-status") && method === "GET") {
       result = await handlers.submissionStatus(userId);
-    }
-    else if (path.includes("/status") && method === "GET") {
+    } else if (path.includes("/status") && method === "GET") {
       result = await handlers.getStatus(userId);
 
-    // Identity - Personal Details
-    } else if (path.includes("/identity/personal-details") && method === "PUT") {
+      // Identity - Personal Details
+    } else if (
+      path.includes("/identity/personal-details") &&
+      method === "PUT"
+    ) {
       result = await handlers.savePersonalDetails(userId, body);
 
-    // Identity - Aadhaar
-    } else if (path.includes("/identity/aadhaar/presign") && method === "POST") {
+      // Identity - Aadhaar
+    } else if (
+      path.includes("/identity/aadhaar/presign") &&
+      method === "POST"
+    ) {
       result = await handlers.aadhaarPresign(userId, body);
-    } else if (path.includes("/identity/aadhaar/confirm") && method === "POST") {
+    } else if (
+      path.includes("/identity/aadhaar/confirm") &&
+      method === "POST"
+    ) {
       result = await handlers.aadhaarConfirm(userId, body);
 
-    // Identity - Selfie
+      // Identity - Selfie
     } else if (path.includes("/identity/selfie/presign") && method === "POST") {
       result = await handlers.selfiePresign(userId);
     } else if (path.includes("/identity/selfie/confirm") && method === "POST") {
       result = await handlers.selfieConfirm(userId, body);
 
-    // Identity - Complete
+      // Identity - Complete
     } else if (path.includes("/identity/complete") && method === "POST") {
       result = await handlers.identityComplete(userId);
 
-    // Mentorship - Categories
-  } else if (path.includes("/mentorship/categories") && method === "POST") {
-    result = await handlers.saveCategories(userId, body, role);
+      // Mentorship - Categories
+    } else if (path.includes("/mentorship/categories") && method === "POST") {
+      result = await handlers.saveCategories(userId, body, role);
 
-    // Mentorship - Notes
+      // Mentorship - Notes
     } else if (path.includes("/mentorship/notes") && method === "POST") {
       result = await handlers.saveNotes(userId, body);
 
-    // Mentorship - Complete
+      // Mentorship - Complete
     } else if (path.includes("/mentorship/complete") && method === "POST") {
       result = await handlers.mentorshipComplete(userId);
 
-    // Education CRUD
+      // Education CRUD
     } else if (path.includes("/education/presign") && method === "POST") {
       result = await handlers.educationPresign(userId, body);
     } else if (path.match(/\/education\/?$/) && method === "GET") {
@@ -1146,7 +1306,7 @@ export const handler = async (event) => {
       const educationId = path.split("/").pop();
       result = await handlers.deleteEducation(userId, educationId, role);
 
-    // Experience CRUD
+      // Experience CRUD
     } else if (path.match(/\/experience\/?$/) && method === "GET") {
       result = await handlers.getExperience(userId);
     } else if (path.match(/\/experience\/?$/) && method === "POST") {
@@ -1158,10 +1318,9 @@ export const handler = async (event) => {
       const experienceId = path.split("/").pop();
       result = await handlers.deleteExperience(userId, experienceId);
 
-    // Submit
+      // Submit
     } else if (path.includes("/submit") && method === "POST") {
       result = await handlers.submit(userId);
-
     } else {
       result = { statusCode: 404, body: { error: "Not found" } };
     }
@@ -1175,10 +1334,16 @@ export const handler = async (event) => {
       error.name === "TokenExpiredError" ||
       error.message?.includes("authorization header")
     ) {
-      return respond({ statusCode: 401, body: { error: "Invalid or expired token" } });
+      return respond({
+        statusCode: 401,
+        body: { error: "Invalid or expired token" },
+      });
     }
 
-    return respond({ statusCode: 500, body: { error: "Internal server error" } });
+    return respond({
+      statusCode: 500,
+      body: { error: "Internal server error" },
+    });
   }
 };
 
