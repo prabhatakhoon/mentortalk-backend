@@ -199,7 +199,7 @@ const handlers = {
        ORDER BY created_at DESC LIMIT 1`,
       [appData.id],
     );
-
+    const raw = latestReview.rows[0]?.comments;
     //Remove unused code
     // const adminComments = latestReview.rows[0]?.comments
     //   ? typeof latestReview.rows[0].comments === "string"
