@@ -200,11 +200,16 @@ const handlers = {
       [appData.id],
     );
 
-    const adminComments = latestReview.rows[0]?.comments
-      ? typeof latestReview.rows[0].comments === "string"
-        ? JSON.parse(latestReview.rows[0].comments)
-        : latestReview.rows[0].comments
-      : {};
+    //Remove unused code
+    // const adminComments = latestReview.rows[0]?.comments
+    //   ? typeof latestReview.rows[0].comments === "string"
+    //     ? JSON.parse(latestReview.rows[0].comments)
+    //     : latestReview.rows[0].comments
+    //   : {};
+    //===============
+    const adminComments =
+      raw && typeof raw === "object" ? raw : { message: raw || "" };
+    // =============
 
     const identityData = identity.rows[0] || {};
     const userData = user.rows[0] || {};
