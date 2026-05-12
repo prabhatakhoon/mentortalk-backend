@@ -660,6 +660,136 @@ const handlers = {
   },
 
   // ──────────────────────────────────────────────────────────
+  // POST /admin/notifications/broadcast
+  // Send FCM to all mentors matching the given filters
+  // ──────────────────────────────────────────────────────────
+  broadcastNotification: async (body) => {
+    const {
+      submission_status,
+      step1_status,
+      step2_status,
+      title,
+      body: notificationBody,
+      test_mode = false,
+    } = body;
+
+    if (!title || !notificationBody || title.length > 200) {
+      return {
+        statusCode: 400,
+        body: { error: "title and body are required; title max 200 chars" },
+      };
+    }
+
+    if (notificationBody.length > 1000) {
+      return {
+        statusCode: 400,
+        body: { error: "body must be 1000 characters or fewer" },
+      };
+    }
+
+    const db = await getPool();
+
+    // Build query filters
+    const conditions = [];
+    const params = [];
+
+    // test_mode filter
+    conditions.push(
+      test_mode
+        ? "u.is_test_account"
+        : "NOT u.is_test_account",
+    );
+
+    // submission_status filter (array of allowed statuses)
+    if (submission_status && Array.isArray(submission_status) && submission_status.length > 0) {
+      const validStatuses = submission_status.filter((s) =>
+        ["under_review", "approved", "rejected", "action_required", "in_progress"].includes(s),
+      );
+      if (validStatuses.length > 0) {
+        const placeholders = validStatuses.map((_, i) => `$${params.length + i + 1}`);
+        conditions.push(`ma.submission_status::text IN (${placeholders.join(", ")})`);
+        params.push(...validStatuses);
+      }
+    }
+
+    // step1_status filter (array of allowed statuses)
+    if (step1_status && Array.isArray(step1_status) && step1_status.length > 0) {
+      const validStatuses = step1_status.filter((s) =>
+        ["done", "in_progress", "action_required", "locked"].includes(s),
+      );
+      if (validStatuses.length > 0) {
+        const placeholders = validStatuses.map((_, i) => `$${params.length + i + 1}`);
+        conditions.push(`ma.step1_status::text IN (${placeholders.join(", ")})`);
+        params.push(...validStatuses);
+      }
+    }
+
+    // step2_status filter (array of allowed statuses)
+    if (step2_status && Array.isArray(step2_status) && step2_status.length > 0) {
+      const validStatuses = step2_status.filter((s) =>
+        ["done", "in_progress", "action_required", "locked"].includes(s),
+      );
+      if (validStatuses.length > 0) {
+        const placeholders = validStatuses.map((_, i) => `$${params.length + i + 1}`);
+        conditions.push(`ma.step2_status::text IN (${placeholders.join(", ")})`);
+        params.push(...validStatuses);
+      }
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+    // Fetch matching user IDs
+    const result = await db.query(
+      `SELECT DISTINCT u.id AS user_id
+       FROM mentorship_application ma
+       JOIN "user" u ON u.id = ma.user_id
+       ${where}
+       ORDER BY u.id`,
+      params,
+    );
+
+    const userIds = result.rows.map((r) => r.user_id);
+
+    if (userIds.length === 0) {
+      return {
+        statusCode: 200,
+        body: {
+          message: "No matching mentors found",
+          total: 0,
+          sent: 0,
+          skipped: 0,
+        },
+      };
+    }
+
+    // Send FCM to each matched user
+    let sent = 0;
+    let skipped = 0;
+    for (const userId of userIds) {
+      const success = await sendFcmNotification(userId, {
+        title,
+        body: notificationBody,
+        data: { type: "admin_broadcast" },
+      });
+      if (success) {
+        sent++;
+      } else {
+        skipped++;
+      }
+    }
+
+    return {
+      statusCode: 200,
+      body: {
+        message: `Notification broadcast complete`,
+        total: userIds.length,
+        sent,
+        skipped,
+      },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
   // GET /admin/users?q=search
   // ──────────────────────────────────────────────────────────
   searchUsers: async (queryParams) => {
@@ -4383,6 +4513,12 @@ export const handler = async (event) => {
     // POST /admin/notifications/send
     if (path.includes("/admin/notifications/send") && method === "POST") {
       result = await handlers.sendNotification(body);
+      return respond(result);
+    }
+
+    // POST /admin/notifications/broadcast
+    if (path.includes("/admin/notifications/broadcast") && method === "POST") {
+      result = await handlers.broadcastNotification(body);
       return respond(result);
     }
 
