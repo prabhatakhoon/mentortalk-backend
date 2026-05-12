@@ -64,3 +64,70 @@ This repo's own `audit/` folder holds per-Lambda audit notes that are specific t
 New documentation goes in `mentortalk-docs`, not here. Schema migrations go in `../mentortalk-docs/schema/migrations/`, with `schema.md` updated in the same PR.
 
 The `audit/` folder is the one exception — it holds per-Lambda audit notes specific to this backend codebase.
+
+## Environment Variables
+
+All env vars are listed in `.env.example` (the committed template). Copy it to `.env.local` and populate with real values — `.env.local` is gitignored.
+
+| Variable | Purpose | Set on |
+|---|---|---|
+| `API_GATEWAY_ID` | REST API ID (`485ccgtm48`), used in CLI scripts only | Developer machine |
+| `WS_ENDPOINT` | WebSocket API endpoint URL, used at Lambda runtime | AWS Lambda |
+| `CDN_BASE_URL` | Base URL for serving profile photos / media | AWS Lambda |
+| `SCHEDULER_ROLE_ARN` | IAM role for EventBridge Scheduler | AWS Lambda |
+| `GRACE_PERIOD_LAMBDA_ARN` | Lambda ARN for session grace period | AWS Lambda |
+| `FREE_CHAT_TIMEOUT_LAMBDA_ARN` | Lambda ARN for free-chat timeout | AWS Lambda |
+| `REQUEST_TIMEOUT_LAMBDA_ARN` | Lambda ARN for request timeout | AWS Lambda |
+| `DISCONNECT_CHECK_LAMBDA_ARN` | Lambda ARN for disconnect check | AWS Lambda |
+| `SFN_ARN` | Step Function state machine ARN | AWS Lambda |
+| `ENABLE_TEST_ACCOUNT` | `"true"` to allow seed-test-wallet and skip some checks | AWS Lambda |
+| `LAUNCH_DATE` | ISO date for platform launch (mentors see countdown) | AWS Lambda |
+| `MIN_SESSION_DURATION_SECS` | Min session seconds before payout earned (default `60`) | AWS Lambda |
+| `JWT_SECRET` | JWT signing key (prod uses Secrets Manager; env var for local testing only) | AWS Lambda (mentortalk-auth) |
+
+Most vars are set as Lambda environment variables in the AWS Console. `API_GATEWAY_ID` is the exception — it's only needed locally for CLI commands like `aws apigateway create-resource`.
+
+## Deploy scripts
+
+### `update.ps1`
+Deploy a single Lambda. Run from **PowerShell** in `mentortalk-backend/`:
+
+```powershell
+.\update.ps1 <lambda-name> "<commit message>"
+```
+
+It does: git add+commit+push → zip (`tar -acf`) → `aws lambda update-function-code` → force-tag `deploy/<lambda>/latest`.
+
+### `deploy-many.ps1`
+Deploy multiple Lambdas in one command with parallel zip+upload:
+
+```powershell
+.\deploy-many.ps1 -Lambdas ([ordered]@{
+    'mentortalk-mentee-discover' = 'commit message 1'
+    'mentortalk-onboarding'      = 'commit message 2'
+})
+```
+
+See `../mentortalk-docs/aws-operations-manual.md` §2 for full usage, failure modes, and recovery.
+
+### Zip pitfall: always use PowerShell `tar -acf`, never Bash
+
+`tar -acf ..\lambda.zip *` only works with **Windows bsdtar** (resolved by PowerShell). Bash / Git Bash / WSL ship GNU tar which silently produces a tarball — AWS rejects it. Verify magic bytes before uploading:
+
+```powershell
+$bytes = [System.IO.File]::ReadAllBytes("lambda.zip")
+$magic = ($bytes[0..1] | ForEach-Object { $_.ToString("X2") }) -join "-"
+# Must output "50-4B" (PK header). Anything else = bad zip.
+```
+
+If `update.ps1` fails with `ABORT: lambda.zip is not a valid PK zip`, rebuild from **PowerShell**:
+```powershell
+cd mentortalk-backend
+Remove-Item .\lambda.zip -Force -ErrorAction SilentlyContinue
+Push-Location ".\mentortalk-admin"
+& "$env:SystemRoot\System32\tar.exe" -acf ..\lambda.zip *
+Pop-Location
+aws lambda update-function-code --function-name mentortalk-admin --zip-file fileb://lambda.zip --region ap-south-1
+git tag -f "deploy/mentortalk-admin/latest" HEAD
+git push -f origin "deploy/mentortalk-admin/latest"
+```
