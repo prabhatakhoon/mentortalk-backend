@@ -1429,6 +1429,155 @@ const handlers = {
   },
 
   // ──────────────────────────────────────────────────────────
+  // DELETE /admin/users/:userId/categories/:categoryId
+  //
+  // Removes all user_mentorship rows for a single category (including
+  // any options selected under it). Used by admins to clean up a
+  // category a mentor selected during onboarding.
+  //
+  // Body: { reviewer_id, reason }
+  // Response: { message, category_id }
+  // Audit: admin_action_log action='mentor_category_deleted'
+  // ──────────────────────────────────────────────────────────
+  deleteMentorCategory: async (userId, categoryId, body) => {
+    const reviewerId = body.reviewer_id;
+    const reason = (body.reason || "").trim();
+
+    if (!reviewerId) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    if (!reason) {
+      return {
+        statusCode: 400,
+        body: { error: "reason is required for the audit trail" },
+      };
+    }
+
+    const db = await getPool();
+
+    // Fetch the rows before deleting so we can include them in the audit
+    const beforeRows = await db.query(
+      `SELECT mentorship_category_id, mentorship_option_id, role
+       FROM user_mentorship
+       WHERE user_id = $1 AND mentorship_category_id = $2 AND role = 'mentor'`,
+      [userId, categoryId],
+    );
+    if (beforeRows.rows.length === 0) {
+      return { statusCode: 404, body: { error: "Category entry not found" } };
+    }
+
+    const deleted = beforeRows.rows;
+
+    await db.query(
+      `DELETE FROM user_mentorship
+       WHERE user_id = $1 AND mentorship_category_id = $2 AND role = 'mentor'`,
+      [userId, categoryId],
+    );
+
+    // If no categories remain, mark step2 as in_progress so the mentor
+    // knows they need to re-select categories.
+    const remaining = await db.query(
+      `SELECT 1 FROM user_mentorship WHERE user_id = $1 AND role = 'mentor' LIMIT 1`,
+      [userId],
+    );
+    if (remaining.rows.length === 0) {
+      await db.query(
+        `UPDATE mentorship_application
+         SET step2_status = 'in_progress', updated_at = NOW()
+         WHERE user_id = $1`,
+        [userId],
+      );
+    }
+
+    await db.query(
+      `INSERT INTO admin_action_log (admin_id, target_user_id, action, reason, metadata)
+       VALUES ($1, $2, 'mentor_category_deleted', $3, $4)`,
+      [
+        reviewerId,
+        userId,
+        reason,
+        JSON.stringify({
+          category_id: categoryId,
+          deleted_rows: deleted.map((r) => ({
+            mentorship_category_id: r.mentorship_category_id,
+            mentorship_option_id: r.mentorship_option_id,
+            role: r.role,
+          })),
+        }),
+      ],
+    );
+
+    return {
+      statusCode: 200,
+      body: { message: "Category entry deleted", category_id: categoryId },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // PUT /admin/users/:userId/bio
+  //
+  // Lets admins edit a mentor's bio. The before and after values
+  // are captured in the audit log.
+  //
+  // Body: { reviewer_id, reason, bio }
+  // Response: { message }
+  // Audit: admin_action_log action='mentor_bio_updated'
+  // ──────────────────────────────────────────────────────────
+  updateMentorBio: async (userId, body) => {
+    const reviewerId = body.reviewer_id;
+    const reason = (body.reason || "").trim();
+    const bio = body.bio !== undefined ? String(body.bio).trim() : undefined;
+
+    if (!reviewerId) {
+      return { statusCode: 400, body: { error: "reviewer_id is required" } };
+    }
+    if (!reason) {
+      return {
+        statusCode: 400,
+        body: { error: "reason is required for the audit trail" },
+      };
+    }
+    if (bio === undefined) {
+      return { statusCode: 400, body: { error: "bio is required" } };
+    }
+
+    const db = await getPool();
+
+    const profileRes = await db.query(
+      `SELECT bio FROM mentor_profile WHERE user_id = $1`,
+      [userId],
+    );
+    if (profileRes.rows.length === 0) {
+      return { statusCode: 404, body: { error: "Mentor profile not found" } };
+    }
+    const beforeBio = profileRes.rows[0].bio;
+
+    await db.query(
+      `UPDATE mentor_profile SET bio = $1 WHERE user_id = $2`,
+      [bio, userId],
+    );
+
+    await db.query(
+      `INSERT INTO admin_action_log (admin_id, target_user_id, action, reason, metadata)
+       VALUES ($1, $2, 'mentor_bio_updated', $3, $4)`,
+      [
+        reviewerId,
+        userId,
+        reason,
+        JSON.stringify({
+          before: beforeBio,
+          after: bio,
+        }),
+      ],
+    );
+
+    return {
+      statusCode: 200,
+      body: { message: "Mentor bio updated" },
+    };
+  },
+
+  // ──────────────────────────────────────────────────────────
   // GET /admin/reports?status=pending
   // ──────────────────────────────────────────────────────────
   getReports: async (queryParams) => {
@@ -4318,6 +4467,26 @@ export const handler = async (event) => {
         eduMatch[2],
         body,
       );
+      return respond(result);
+    }
+
+    // DELETE /admin/users/:userId/categories/:categoryId
+    const catMatch = path.match(
+      /\/admin\/users\/([\w-]+)\/categories\/([\w-]+)$/,
+    );
+    if (catMatch && method === "DELETE") {
+      result = await handlers.deleteMentorCategory(
+        catMatch[1],
+        catMatch[2],
+        body,
+      );
+      return respond(result);
+    }
+
+    // PUT /admin/users/:userId/bio
+    const bioMatch = path.match(/\/admin\/users\/([\w-]+)\/bio$/);
+    if (bioMatch && method === "PUT") {
+      result = await handlers.updateMentorBio(bioMatch[1], body);
       return respond(result);
     }
 
