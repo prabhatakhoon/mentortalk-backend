@@ -400,6 +400,33 @@ LEFT JOIN user_language ul ON ul.user_id = u.id AND ul.role = 'mentor'
 
   const row = result.rows[0];
 
+  // Fetch structured mentorship: category names with their selected options.
+  // Mirrors the mentee /onboarding/categories shape but filtered to selections.
+  const mentorshipResult = await db.query(
+    `SELECT mc.name AS category, mo.name AS option
+     FROM user_mentorship um
+     JOIN mentorship_category mc ON mc.id = um.mentorship_category_id
+     LEFT JOIN mentorship_option mo ON mo.id = um.mentorship_option_id
+     WHERE um.user_id = $1 AND um.role = 'mentor'
+     ORDER BY mc.name, mo.name`,
+    [userId]
+  );
+
+  // Group options by category name
+  const mentorshipMap = new Map();
+  for (const r of mentorshipResult.rows) {
+    if (!mentorshipMap.has(r.category)) {
+      mentorshipMap.set(r.category, []);
+    }
+    if (r.option) {
+      mentorshipMap.get(r.category).push(r.option);
+    }
+  }
+  const mentorship = Array.from(mentorshipMap, ([category, options]) => ({
+    category,
+    options,
+  }));
+
   // Mentor's own profile shows ALL their photos regardless of status, with
   // status + rejection_reason so the app can render badges. Mentees only see
   // approved rows — that filter lives on mentee-discover, not here.
@@ -460,6 +487,7 @@ LEFT JOIN user_language ul ON ul.user_id = u.id AND ul.role = 'mentor'
       max_rate: row.tier_max_rate ? parseFloat(row.tier_max_rate) : 0,
     },
     categories: row.categories || [],
+    mentorship,
     languages: row.languages || [],
     member_since: row.member_since,
     free_chat: {
