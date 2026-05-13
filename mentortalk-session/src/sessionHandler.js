@@ -771,8 +771,12 @@ async function handleSessionRequest(menteeId, event) {
           type: "session_request",
           session_id: session.id,
           mentee_name: menteeName,
+          mentee_avatar: menteeAvatar,
           session_type,
+          ring: "true",
         },
+        app: "mentor",
+        androidChannelId: "incoming_session",
       }
     );
   }
@@ -1293,11 +1297,14 @@ async function handleSessionReject(userId, event) {
   }
 
   // Normal rejection (or free chat with no candidates)
+  const isPaidOrIntro = session.billing_type === "paid" || session.billing_type === "intro_rate";
   const sessionResult = await db.query(
-    `UPDATE session SET status = 'rejected', ended_at = NOW(), request_timeout_schedule = NULL
+    `UPDATE session SET status = 'rejected', ended_at = NOW(), request_timeout_schedule = NULL,
+       missed_call_reason = $3,
+       mentor_viewed_at = CASE WHEN $3::varchar IS NOT NULL THEN NOW() ELSE NULL END
      WHERE id = $1 AND mentor_id = $2 AND status = 'requested'
      RETURNING mentee_id`,
-    [sessionId, userId]
+    [sessionId, userId, isPaidOrIntro ? "rejected" : null]
   );
 
   if (sessionResult.rows.length === 0) {
@@ -1359,7 +1366,7 @@ async function handleSessionCancel(menteeId, event) {
   const db = await getPool();
 
   const sessionData = await db.query(
-    `SELECT request_timeout_schedule, billing_type FROM session
+    `SELECT request_timeout_schedule, billing_type, created_at FROM session
      WHERE id = $1 AND mentee_id = $2 AND status IN ('requested', 'pending')`,
     [sessionId, menteeId]
   );
@@ -1370,6 +1377,25 @@ async function handleSessionCancel(menteeId, event) {
      RETURNING mentor_id, status`,
     [sessionId, menteeId]
   );
+
+  // Mark as missed call if paid/intro_rate session was cancelled after threshold
+  if (sessionData.rows.length > 0) {
+    const s = sessionData.rows[0];
+    const isPaidOrIntro = s.billing_type === "paid" || s.billing_type === "intro_rate";
+    if (isPaidOrIntro) {
+      const thresholdResult = await db.query(
+        `SELECT COALESCE(missed_call_cancel_threshold_secs, 30) AS threshold FROM promo_config WHERE id = 1`
+      );
+      const threshold = thresholdResult.rows[0]?.threshold || 30;
+      const elapsed = Math.floor((Date.now() - new Date(s.created_at).getTime()) / 1000);
+      if (elapsed > threshold) {
+        await db.query(
+          `UPDATE "session" SET missed_call_reason = 'cancelled_after_threshold' WHERE id = $1`,
+          [sessionId]
+        );
+      }
+    }
+  }
 
   if (sessionResult.rows.length === 0) {
     return respond(404, { error: "Session not found or cannot be cancelled" });

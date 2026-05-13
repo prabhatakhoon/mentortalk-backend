@@ -247,6 +247,14 @@ export const handler = async (event) => {
       return await getSessionDetails(userId, event);
     }
 
+    // ─── Missed Calls ──────────────────────────────────────
+    if (method === "GET" && path === "/mentor/sessions/missed-calls") {
+      return await getMissedCalls(userId, event);
+    }
+    if (method === "PATCH" && path === "/mentor/sessions/missed-calls/view") {
+      return await markMissedCallsViewed(userId);
+    }
+
     // ─── Transactions ──────────────────────────────────────
     if (method === "GET" && path === "/mentor/transactions") {
       return await getTransactions(userId, event);
@@ -2795,4 +2803,92 @@ async function getPayoutsList(userId, event) {
     has_more: hasMore,
     next_cursor: nextCursor,
   });
+}
+
+// ─── GET /mentor/sessions/missed-calls ────────────────────────
+
+async function getMissedCalls(userId, event) {
+  const db = await getPool();
+  const params = event.queryStringParameters || {};
+  const tab = params.tab || "all"; // all | rejected | missed
+
+  let tabFilter = "";
+  const filterParams = [userId];
+
+  if (tab === "rejected") {
+    tabFilter = "AND s.missed_call_reason = 'rejected'";
+  } else if (tab === "missed") {
+    tabFilter = "AND s.missed_call_reason IN ('timeout', 'cancelled_after_threshold')";
+  }
+
+  let limit = parseInt(params.limit, 10);
+  if (!Number.isFinite(limit) || limit <= 0) limit = 20;
+  if (limit > 50) limit = 50;
+
+  const cursor = decodeCursor(params.cursor);
+  const cursorTs = cursor?.created_at || null;
+  const cursorId = cursor?.id || null;
+
+  // Fetch mentee info + rate via JOINs
+  const result = await db.query(
+    `SELECT s.id, s.mentee_id, s.requested_session_type, s.billing_type,
+            s.missed_call_reason, s.mentor_viewed_at,
+            s.created_at, s.ended_at,
+            ss.rate_per_minute,
+            mp.first_name AS mentee_first_name,
+            mp.last_name AS mentee_last_name,
+            mp.profile_photo_url AS mentee_avatar
+     FROM "session" s
+     JOIN mentee_profile mp ON mp.user_id = s.mentee_id
+     LEFT JOIN session_segment ss ON ss.session_id = s.id
+     WHERE s.mentor_id = $1
+       AND s.missed_call_reason IS NOT NULL
+       ${tabFilter}
+       AND ($2::timestamptz IS NULL OR (s.created_at, s.id) < ($2::timestamptz, $3::uuid))
+     ORDER BY s.created_at DESC, s.id DESC
+     LIMIT $4`,
+    [...filterParams, cursorTs, cursorId, limit + 1]
+  );
+
+  const rows = result.rows;
+  const hasMore = rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  const nextCursor = hasMore ? encodeCursor(pageRows[pageRows.length - 1]) : null;
+
+  const items = pageRows.map((r) => {
+    const menteeName = [r.mentee_first_name, r.mentee_last_name].filter(Boolean).join(" ") || "Mentee";
+    return {
+      session_id: r.id,
+      mentee_name: menteeName,
+      mentee_avatar: toFullUrl(r.mentee_avatar),
+      session_type: r.requested_session_type,
+      billing_type: r.billing_type,
+      rate_per_minute: parseFloat(r.rate_per_minute) || 0,
+      missed_call_reason: r.missed_call_reason,
+      created_at: r.created_at,
+      ended_at: r.ended_at,
+      viewed: r.mentor_viewed_at != null,
+    };
+  });
+
+  return respond(200, {
+    items,
+    has_more: hasMore,
+    next_cursor: nextCursor,
+  });
+}
+
+// ─── PATCH /mentor/sessions/missed-calls/view ─────────────────
+
+async function markMissedCallsViewed(userId) {
+  const db = await getPool();
+  await db.query(
+    `UPDATE "session"
+     SET mentor_viewed_at = NOW()
+     WHERE mentor_id = $1
+       AND missed_call_reason IS NOT NULL
+       AND mentor_viewed_at IS NULL`,
+    [userId]
+  );
+  return respond(200, { viewed: true });
 }

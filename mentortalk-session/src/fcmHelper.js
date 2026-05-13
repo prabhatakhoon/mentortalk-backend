@@ -167,9 +167,9 @@ export async function sendFcmNotification(userId, { title, body, data = {} }, op
         },
         data: stringData,
         android: {
-          priority: "high",
+          priority: opts.priority || "high",
           notification: {
-            channel_id: "session_notifications",
+            channel_id: opts.androidChannelId || "session_notifications",
             sound: "default",
           },
         },
