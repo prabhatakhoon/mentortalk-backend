@@ -93,7 +93,7 @@ export const handler = async (event) => {
   const db = await getPool();
 
   const result = await db.query(
-    `SELECT id, mentor_id, mentee_id, status
+    `SELECT id, mentor_id, mentee_id, status, billing_type
      FROM session
      WHERE id = $1`,
     [sessionId]
@@ -111,11 +111,13 @@ export const handler = async (event) => {
     return { cancelled: false, reason: `Already ${session.status}` };
   }
 
-  // Auto-cancel the session
+  // Auto-cancel the session; mark as missed call for paid / intro_rate
+  const isPaidOrIntro = session.billing_type === "paid" || session.billing_type === "intro_rate";
   await db.query(
-    `UPDATE session SET status = 'timed_out', ended_at = NOW(), request_timeout_schedule = NULL
+    `UPDATE session SET status = 'timed_out', ended_at = NOW(), request_timeout_schedule = NULL,
+       missed_call_reason = $2
      WHERE id = $1`,
-    [sessionId]
+    [sessionId, isPaidOrIntro ? "timeout" : null]
   );
 
   // Notify mentee
