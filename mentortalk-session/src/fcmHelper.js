@@ -152,9 +152,11 @@ export async function sendFcmNotification(userId, { title, body, data = {} }, op
     const sa = await getServiceAccount();
     const projectId = sa.project_id;
 
-    // Ensure all data values are strings (FCM requirement)
+    // Ensure all data values are strings (FCM requirement).
+    // Skip null/undefined values so the receiver doesn't get "null"/"undefined" strings.
     const stringData = {};
     for (const [key, value] of Object.entries(data)) {
+      if (value === null || value === undefined) continue;
       stringData[key] = String(value);
     }
 

@@ -770,9 +770,14 @@ async function handleSessionRequest(menteeId, event) {
         data: {
           type: "session_request",
           session_id: session.id,
+          mentee_id: menteeId,
           mentee_name: menteeName,
           mentee_avatar: menteeAvatar,
           session_type,
+          billing_type: billingType,
+          rate_per_minute: String(billingType === 'intro_rate' ? introRatePerMinute : ratePerMinute),
+          normal_rate_per_minute: billingType === 'intro_rate' ? String(ratePerMinute) : undefined,
+          timeout_seconds: String(SESSION_REQUEST_TIMEOUT_SECONDS),
           ring: "true",
         },
         app: "mentor",
@@ -1284,7 +1289,14 @@ async function handleSessionReject(userId, event) {
           data: {
             type: "session_request",
             session_id: sessionId,
-            is_free_chat: "true",
+            mentee_id: session.mentee_id,
+            mentee_name: menteeName,
+            mentee_avatar: menteeAvatar,
+            session_type: "chat",
+            billing_type: session.billing_type,  // 'free_intro' — this branch only runs for free chat
+            rate_per_minute: "0",
+            timeout_seconds: String(timeoutSecs),
+            ring: "true",
           },
         }
       );
