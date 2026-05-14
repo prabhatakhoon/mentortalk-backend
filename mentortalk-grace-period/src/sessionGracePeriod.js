@@ -281,7 +281,7 @@ export const handler = async (event) => {
     await pushToUser(session.mentee_id, sysMsgPayload);
     await pushToUser(session.mentor_id, sysMsgPayload);
 
-    // 5. Notify both users
+    // 5. Notify both users (session_updates channel — not a request, just a status change)
     await pushToUser(
       session.mentee_id,
       { type: "session_ended", ended_by: "system", reason: "peer_disconnected", ...summary },
@@ -289,6 +289,7 @@ export const handler = async (event) => {
         title: "Session Ended",
         body: `Session ended — user disconnected. Cost: ₹${grossAmount}`,
         data: { type: "session_ended", session_id: sessionId, ended_by: "system" },
+        androidChannelId: "session_updates",
       }
     );
 
@@ -299,6 +300,7 @@ export const handler = async (event) => {
         title: "Session Ended",
         body: `Session ended — user disconnected. Earned: ₹${mentorEarning}`,
         data: { type: "session_ended", session_id: sessionId, ended_by: "system" },
+        androidChannelId: "session_updates",
       }
     );
 
@@ -318,7 +320,8 @@ export const handler = async (event) => {
   }
 };
 
-// ─── Queue Promotion (same as sessionTimeout.js) ────────────
+// ─── Queue Promotion ─────────────────────────────────────────
+// Full implementation — kept in sync with sessionHandler.js:promoteNextPendingSession
 
 async function promoteNextPendingSession(db, mentorId) {
   const pendingResult = await db.query(
@@ -338,21 +341,105 @@ async function promoteNextPendingSession(db, mentorId) {
 
   const promoted = pendingResult.rows[0];
 
+  // Guard: only promote if mentor is still available
+  const mentorAvail = await db.query(
+    `SELECT is_available FROM mentor_profile WHERE user_id = $1`,
+    [mentorId]
+  );
+  if (!mentorAvail.rows[0]?.is_available) {
+    console.log(`Mentor ${mentorId} is not available — reverting promotion of session ${promoted.id}`);
+    await db.query(
+      `UPDATE session SET status = 'pending' WHERE id = $1`,
+      [promoted.id]
+    );
+    return;
+  }
+
+  // Create timeout schedule for promoted session
+  const REQUEST_TIMEOUT_LAMBDA_ARN = process.env.REQUEST_TIMEOUT_LAMBDA_ARN;
+  const SCHEDULER_ROLE_ARN = process.env.SCHEDULER_ROLE_ARN;
+  if (REQUEST_TIMEOUT_LAMBDA_ARN && SCHEDULER_ROLE_ARN) {
+    const { SchedulerClient, CreateScheduleCommand } = await (async () => {
+      const { SchedulerClient: SC, CreateScheduleCommand: CSC } = await import("@aws-sdk/client-scheduler");
+      return { SchedulerClient: SC, CreateScheduleCommand: CSC };
+    })();
+    const schedulerClient = new SchedulerClient({ region: "ap-south-1" });
+    const scheduleName = `rt-${promoted.id}-${String(Date.now()).slice(-6)}`;
+    const fireAt = new Date(Date.now() + 60 * 1000);
+
+    try {
+      await schedulerClient.send(new CreateScheduleCommand({
+        Name: scheduleName,
+        ScheduleExpression: `at(${fireAt.toISOString().replace(/\.\d{3}Z$/, '')})`,
+        ScheduleExpressionTimezone: "UTC",
+        FlexibleTimeWindow: { Mode: "OFF" },
+        Target: {
+          Arn: REQUEST_TIMEOUT_LAMBDA_ARN,
+          RoleArn: SCHEDULER_ROLE_ARN,
+          Input: JSON.stringify({ sessionId: promoted.id }),
+        },
+        ActionAfterCompletion: "DELETE",
+      }));
+
+      await db.query(
+        `UPDATE session SET request_timeout_schedule = $2 WHERE id = $1`,
+        [promoted.id, scheduleName]
+      );
+    } catch (err) {
+      console.error("Failed to create request timeout schedule:", err.message);
+    }
+  }
+
+  // Fetch mentee name + avatar
   const menteeResult = await db.query(
-    `SELECT first_name, last_name FROM mentee_profile WHERE user_id = $1`,
+    `SELECT first_name, last_name, profile_photo_url FROM mentee_profile WHERE user_id = $1`,
     [promoted.mentee_id]
   );
   const menteeRow = menteeResult.rows[0];
   const menteeName = [menteeRow?.first_name, menteeRow?.last_name].filter(Boolean).join(' ') || 'Mentee';
 
+  function toFullUrl(path) {
+    if (!path || path.startsWith('http')) return path;
+    const cdnBase = process.env.CDN_BASE_URL;
+    if (cdnBase) return `${cdnBase}/${path}`;
+    return null;
+  }
+  const menteeAvatar = toFullUrl(menteeRow?.profile_photo_url);
+
+  // Fetch rate + chat discount
   const mentorProfile = await db.query(
-    `SELECT rate_per_minute FROM mentor_profile WHERE user_id = $1`,
+    `SELECT rate_per_minute, chat_discount_percent FROM mentor_profile WHERE user_id = $1`,
     [mentorId]
   );
-  const ratePerMinute = parseFloat(mentorProfile.rows[0]?.rate_per_minute) || 0;
+  const baseRate = parseFloat(mentorProfile.rows[0]?.rate_per_minute) || 0;
+  const chatDiscountPercent = mentorProfile.rows[0]?.chat_discount_percent;
 
   const promotedType = promoted.requested_session_type || "chat";
+  let ratePerMinute = baseRate;
+  if (promotedType === 'video') {
+    ratePerMinute = baseRate * 1.5;
+  } else if (promotedType === 'chat' && chatDiscountPercent != null) {
+    ratePerMinute = baseRate * (1 - chatDiscountPercent / 100);
+  }
 
+  // Get billing type
+  const promotedSession = await db.query(
+    `SELECT billing_type FROM session WHERE id = $1`,
+    [promoted.id]
+  );
+  const promotedBillingType = promotedSession.rows[0]?.billing_type || 'paid';
+  let promotedEffectiveRate = ratePerMinute;
+  let promotedNormalRate;
+
+  if (promotedBillingType === 'intro_rate') {
+    const cfgRow = await db.query(
+      `SELECT intro_rate_per_minute FROM promo_config WHERE id = 1`
+    );
+    promotedEffectiveRate = parseFloat(cfgRow.rows[0]?.intro_rate_per_minute) || 0;
+    promotedNormalRate = ratePerMinute;
+  }
+
+  // Push to mentor
   await pushToUser(
     mentorId,
     {
@@ -360,8 +447,11 @@ async function promoteNextPendingSession(db, mentorId) {
       session_id: promoted.id,
       mentee_id: promoted.mentee_id,
       mentee_name: menteeName,
+      mentee_avatar: menteeAvatar,
       session_type: promotedType,
-      rate_per_minute: ratePerMinute,
+      billing_type: promotedBillingType,
+      rate_per_minute: promotedEffectiveRate,
+      normal_rate_per_minute: promotedNormalRate,
       timeout_seconds: 60,
     },
     {
@@ -376,10 +466,16 @@ async function promoteNextPendingSession(db, mentorId) {
     }
   );
 
+  // Push to mentee
   await pushToUser(promoted.mentee_id, {
     type: "session_promoted",
     session_id: promoted.id,
     message: "Your session request has been sent to the mentor",
+    session_type: promotedType,
+    rate_per_minute: promotedEffectiveRate,
+    normal_rate_per_minute: promotedNormalRate,
+    billing_type: promotedBillingType,
+    timeout_seconds: 60,
   });
 
   console.log(`Promoted session ${promoted.id} from pending to requested`);
