@@ -82,7 +82,31 @@ exports.handler = async (event) => {
 
     const connectionId = event.requestContext.connectionId;
     await storeConnection(user.userId, connectionId);
-    await updatePresence(user.userId, 'online');
+
+    // Determine correct presence: if user is in an active session (even if
+    // not formally disconnected), they are "in_session", not "online".
+    // Previously presence was always set to 'online', causing mentees to see
+    // the mentor as available mid-call after a WebSocket reconnect.
+    let presenceStatus = 'online';
+    try {
+      const db = await getPool();
+      const activeCheck = await db.query(
+        `SELECT id FROM session
+         WHERE (mentee_id = $1 OR mentor_id = $1)
+           AND status = 'active'
+         LIMIT 1`,
+        [user.userId]
+      );
+      if (activeCheck.rows.length > 0) {
+        presenceStatus = 'in_session';
+      }
+    } catch (err) {
+      console.error('Active-session presence check failed (non-fatal):', err.message);
+      // Default to 'online' if the check fails — better to show available
+      // than permanently unavailable.
+    }
+
+    await updatePresence(user.userId, presenceStatus);
 
     // Broadcast presence to anyone watching this user
     try {
@@ -96,7 +120,7 @@ exports.handler = async (event) => {
         const payload = {
           type: 'presence_update',
           user_id: user.userId,
-          presence: 'online',
+          presence: presenceStatus,
           last_seen: new Date().toISOString(),
         };
 
@@ -108,7 +132,7 @@ exports.handler = async (event) => {
       console.error('Presence broadcast failed (non-fatal):', err.message);
     }
 
-    console.log(`User ${user.userId} connected with connectionId ${connectionId}`);
+    console.log(`User ${user.userId} connected with connectionId ${connectionId} (presence: ${presenceStatus})`);
 
     // ── NEW: Check for disconnected session (reconnection) ──
     try {
