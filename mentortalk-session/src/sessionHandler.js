@@ -1192,7 +1192,16 @@ async function handleSessionReject(userId, event) {
         Key: { user_id: mentorId },
       }));
 
-      if (presence.Item?.status !== "online") continue;
+      if (presence.Item?.status !== "online") {
+        // Not online — check is_available as fallback (pushToUser will
+        // deliver via FCM since WebSocket is not connected)
+        const availCheck = await db.query(
+          `SELECT is_available FROM mentor_profile WHERE user_id = $1`,
+          [mentorId],
+        );
+        if (!availCheck.rows[0]?.is_available) continue;
+        // is_available = true but offline — fallback, will receive FCM push
+      }
 
       const activeCheck = await db.query(
         `SELECT id FROM session WHERE mentor_id = $1 AND status = 'active'`,
@@ -1777,6 +1786,24 @@ async function promoteNextPendingSession(db, mentorId) {
 
   const promoted = pendingResult.rows[0];
 
+  // Guard: only promote if mentor is still available.
+  // If the mentor toggled is_available = false after ending their session
+  // (or during the grace-period / timeout path), don't push a request they
+  // aren't ready to handle.  Revert to 'pending' so the session stays in
+  // queue for when the mentor becomes available again.
+  const mentorAvail = await db.query(
+    `SELECT is_available FROM mentor_profile WHERE user_id = $1`,
+    [mentorId]
+  );
+  if (!mentorAvail.rows[0]?.is_available) {
+    console.log(`Mentor ${mentorId} is not available — reverting promotion of session ${promoted.id}`);
+    await db.query(
+      `UPDATE session SET status = 'pending' WHERE id = $1`,
+      [promoted.id]
+    );
+    return;
+  }
+
   // Create timeout schedule for promoted session
   const scheduleName = await createRequestTimeoutSchedule(promoted.id);
   if (scheduleName) {
@@ -1863,6 +1890,11 @@ async function promoteNextPendingSession(db, mentorId) {
     type: "session_promoted",
     session_id: promoted.id,
     message: "Your session request has been sent to the mentor",
+    session_type: promotedType,
+    rate_per_minute: promotedEffectiveRate,
+    normal_rate_per_minute: promotedNormalRate,
+    billing_type: promotedBillingType,
+    timeout_seconds: SESSION_REQUEST_TIMEOUT_SECONDS,
   });
 
   console.log(`Promoted session ${promoted.id} from pending to requested`);
@@ -1958,7 +1990,7 @@ async function handleFreeChat(menteeId, event) {
        AND COALESCE(q.count, 0) < COALESCE(q.max_count, $2)
        AND mp.user_id != $3
      ORDER BY free_chat_count ASC, RANDOM()
-     LIMIT 5`,
+     LIMIT 25`,
       [menteeCategoryIds, cfg.mentor_daily_free_cap, menteeId, menteeIsTest]
   );
 
@@ -1969,9 +2001,12 @@ async function handleFreeChat(menteeId, event) {
     });
   }
 
-  // 6. Check presence — find first online mentor
+  // 6. Check presence — first online mentor wins the initial request.
+  //    Build forwarding queue: online mentors first, then is_available
+  //    (offline) mentors as fallback so they receive FCM push.
   let selectedMentor = null;
-  const remainingMentors = [];
+  const onlineRemaining = [];
+  const availableFallback = [];
 
   for (const mentor of mentorCandidates.rows) {
     const presence = await dynamoClient.send(new GetCommand({
@@ -1981,10 +2016,16 @@ async function handleFreeChat(menteeId, event) {
 
     if (!selectedMentor && presence.Item?.status === "online") {
       selectedMentor = mentor;
+    } else if (presence.Item?.status === "online") {
+      onlineRemaining.push(mentor.user_id);
     } else {
-      remainingMentors.push(mentor.user_id);
+      // is_available = TRUE (guaranteed by query) but not online — fallback
+      availableFallback.push(mentor.user_id);
     }
   }
+
+  // Queue: online mentors first, then is_available fallbacks
+  const remainingMentors = [...onlineRemaining, ...availableFallback];
 
   if (!selectedMentor) {
     return respond(503, {
